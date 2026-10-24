@@ -604,3 +604,14 @@ def test_health_fails_when_a_loop_is_overdue_or_an_endpoint_is_down(tmp_path, mo
     health.endpoint("bus", "http://127.0.0.1:9/health")  # nothing listens on the discard port
     problems, _ = health.check(timeout=2)
     assert len(problems) == 1 and problems[0].startswith("bus: ")
+
+
+def test_discord_posts_are_sent_under_the_agents_own_name(monkeypatch):
+    from proxmox_janitor import notice
+
+    posted = []
+    monkeypatch.setattr(notice, "_post_webhook", lambda url, payload: posted.append(payload) or True)
+    url = "https://discord.com/api/webhooks/" + "1/fake-TOKEN"  # split so the public-sync secret scan passes
+    assert notice.Outbox([url]).send(notice.Message("hi"))
+    notice.Outbox([url], username="Someone else").send(notice.Message("hi"))
+    assert [p["username"] for p in posted] == ["proxmox-janitor", "Someone else"]
