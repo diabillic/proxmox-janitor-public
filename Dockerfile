@@ -39,6 +39,6 @@ ENV STATE_PATH=/var/lib/proxmox-janitor/state.json
 USER proxmox-janitor
 VOLUME ["/var/lib/proxmox-janitor"]
 EXPOSE 8765
-HEALTHCHECK --interval=60s --timeout=15s --start-period=2m --retries=3 \
+HEALTHCHECK --interval=60s --timeout=15s --start-period=2m --retries=5 \
   CMD ["python", "-m", "proxmox_janitor.health"]
 CMD ["python", "-m", "proxmox_janitor"]
