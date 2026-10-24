@@ -2,8 +2,9 @@
 
 A Message is a title plus sections (a bold heading, an optional note, then lines). Discord webhook
 URLs get it as an embed: colour bar by level, agent name above the title, sections with spacing,
-timestamp in the footer. Every other Apprise URL (ntfy, Pushover, email, ...) gets the same content
-as markdown text.
+timestamp in the footer, posted under the agent's own name (not the webhook's default). Every other
+Apprise URL (ntfy, Pushover, email, ...) gets the same content as markdown text.
+The same file is shared by every agent: keep the copies identical.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ ICON = {"error": "❌", "warning": "⚠️", "info": "ℹ️", "ok": "✅"}
 PAGE = 3800  # characters per embed description; Discord allows 4096 per embed and 6000 per message
 WEBHOOK = re.compile(r"^https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+/?$")
 FIXED, CLEARED = "fixed", "cleared"
+# Who Discord shows as the sender: the agent, named like its container (sonarr_agent -> sonarr-agent).
+AGENT_NAME = (__package__ or "agent").split(".")[0].replace("_", "-")
 
 
 @dataclass
@@ -85,7 +88,8 @@ class Message:
 class Outbox:
     """Delivers Messages: embeds to Discord webhooks, markdown to everything else via Apprise."""
 
-    def __init__(self, urls: list[str], kind: str = "notification"):
+    def __init__(self, urls: list[str], kind: str = "notification", username: str = AGENT_NAME):
+        self.username = username[:80]  # Discord's limit
         self.webhooks = [u for u in urls if WEBHOOK.match(u.split("?", 1)[0])]
         self.apobj = apprise.Apprise()
         for url in urls:
@@ -100,7 +104,10 @@ class Outbox:
         ok = True
         for url in self.webhooks:
             for embed in msg.embeds():
-                ok = _post_webhook(url, {"embeds": [embed], "allowed_mentions": {"parse": []}}) and ok
+                payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+                if self.username:
+                    payload["username"] = self.username
+                ok = _post_webhook(url, payload) and ok
         if len(self.apobj):
             title = f"{msg.author}: {msg.title}" if msg.author else msg.title
             ok = bool(self.apobj.notify(title=title, body=msg.markdown(),
