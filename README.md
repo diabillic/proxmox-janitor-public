@@ -36,6 +36,26 @@ Guardrails:
   first. After the restart it finds the unfinished window and finishes it. Rebooting its own node
   is announced before it happens.
 
+## Uptime Kuma monitors
+
+With `KUMA_URL` set, the janitor gives every agent container a **Docker Container** monitor in Uptime Kuma.
+Every `KUMA_SYNC_MINUTES` (10) it asks each Docker host which containers `agent-deploy` runs there
+(apps such as Uptime Kuma itself are left out). Any agent without a monitor gets one, by container name
+on that host's Docker host entry, with the same settings: `KUMA_INTERVAL` (60 s) and `KUMA_RETRIES` (1),
+plus the notification called `KUMA_NOTIFICATION` (`Discord`). A new agent has its monitor within one
+sync of its first deploy. Monitors are only added, never changed or deleted.
+
+Uptime Kuma needs a Docker host entry per Docker host, named as in `DOCKER_HOSTS` (or mapped with
+`KUMA_DOCKER_HOSTS`). Point each entry at a read-only Docker socket proxy (the dockerfile-agent
+repository's `deploy/apps/docker-socket-proxy`), not at the Docker API itself. Create the notification
+and the entries once, from inside the janitor container, with the webhook on stdin:
+
+```bash
+echo "$DISCORD_WEBHOOK" | docker exec -i proxmox-janitor python -m proxmox_janitor.kuma setup   --docker-host docker1=tcp://docker-socket-proxy:2375 --docker-host docker2=tcp://192.0.2.22:2376
+```
+
+The account must not use 2FA; the janitor logs in with a username and password.
+
 ## How it reaches the cluster
 
 It holds one SSH key and no Proxmox API token.
@@ -106,6 +126,9 @@ Actions**.
 | variable | `PVE_NODES` | `name=address,...` for every node (set by `provision.sh`). |
 | variable | `DOCKER_HOSTS` | `name=address,...` of the Docker hosts whose agents are rebuilt (set by `provision.sh`). |
 | variable | `SELF_GUEST` | VMID of the guest the janitor runs in (set by `provision.sh`). |
+| variable | `KUMA_URL`, `KUMA_USERNAME` | Uptime Kuma's address as the janitor reaches it, e.g. `http://192.0.2.21:3001`, and its login. Unset turns monitor syncing off. |
+| secret | `KUMA_PASSWORD` | That login's password. |
+| variables | `KUMA_NOTIFICATION`, `KUMA_DOCKER_HOSTS`, `KUMA_SYNC_MINUTES`, `KUMA_INTERVAL`, `KUMA_RETRIES` | Optional: notification name (`Discord`), `host=kuma name` mapping, and defaults 10 / 60 / 1. |
 | variable | `TIMEZONE` | IANA zone for the schedule, e.g. `America/New_York` (default `UTC`). |
 | variable | `APPROVAL_MODE` | `client` (assistant buttons) or `code` (default `code`). |
 | variables | `CHECK_TIME`, `WINDOW_DAY`, `WINDOW_TIME`, `WINDOW_HOURS`, `REBOOT_GUESTS`, `REBOOT_NODES`, `REDEPLOY`, `KEEP_SNAPSHOTS`, `SNAPSHOT_KEEP`, `EXCLUDE_GUESTS`, `CPU_PERCENT`, `MEM_PERCENT`, `SUSTAIN_MINUTES`, `MONITOR_SECONDS`, `DISK_PERCENT`, `DISK_TARGET_PERCENT`, `GROW_MIN_GB`, `GROW_MAX_GB`, `STORAGE_MAX_PERCENT`, `DISK_MINUTES`, `RENOTIFY_HOURS`, `AGENT_BUS_PORT`, `BOT_ALERT_URL` | Optional overrides; see `.env.example` for the defaults. |

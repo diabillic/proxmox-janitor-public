@@ -521,3 +521,69 @@ def test_deploy_renders_every_setting_it_is_given(workflow):
     given = set(re.findall(r"^\s+([A-Z_]+): \$\{\{ (?:vars|secrets)\.", env_block, re.M))
     written = set(re.findall(r"[A-Z_]+", re.search(r"for v in (.*?); do", run_block, re.S).group(1)))
     assert given - written == set(), f"passed to the step but never written to agent.env: {sorted(given - written)}"
+
+
+# --- Uptime Kuma ---
+
+class FakeKuma:
+    def __init__(self, monitors=None, notifications=None, docker_hosts=None):
+        self.monitors = monitors or {}
+        self.notifications = notifications if notifications is not None else [{"id": 3, "name": "Discord"}]
+        self.docker_hosts = docker_hosts if docker_hosts is not None else [{"id": 1, "name": "docker1"},
+                                                                           {"id": 2, "name": "docker2"}]
+        self.added = []
+
+    def __call__(self, url, username, password):  # stands in for the KumaClient class
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def add_monitor(self, m):
+        self.added.append(m)
+        return len(self.added)
+
+
+class FakeDockerHosts:
+    def __init__(self, containers):
+        self.containers = containers
+
+    def call(self, host, request, timeout=60):
+        assert request == "containers"
+        return {"containers": self.containers.get(host, [])}
+
+
+def kuma_sync(tmp_path, kuma, containers):
+    from proxmox_janitor.kuma import KumaSync
+    c = cfg(tmp_path, docker_hosts={"docker1": "a", "docker2": "b"}, kuma_url="http://kuma:3001")
+    n = FakeNotifier()
+    return KumaSync(FakeDockerHosts(containers), c, n, State(str(tmp_path / "s.json")), client=kuma), n
+
+
+def test_kuma_adds_a_container_monitor_for_every_agent_once(tmp_path):
+    kuma = FakeKuma(monitors={"7": {"type": "docker", "docker_host": 1, "docker_container": "sonarr-agent",
+                                    "name": "sonarr-agent"}})
+    sync, n = kuma_sync(tmp_path, kuma, {
+        "docker1": [{"name": "sonarr-agent", "kind": "agent"}, {"name": "unraid-agent", "kind": "agent"},
+                    {"name": "uptime-kuma", "kind": "app"}],
+        "docker2": [{"name": "new-agent", "kind": "agent"}]})
+    lines = sync.run_once()
+    assert [(m["docker_container"], m["docker_host"]) for m in kuma.added] == [("unraid-agent", 1), ("new-agent", 2)]
+    m = kuma.added[0]
+    assert m["type"] == "docker" and m["interval"] == 60 and m["maxretries"] == 1
+    assert m["notificationIDList"] == {"3": True} and m["accepted_statuscodes"] == ["200-299"]
+    assert len(lines) == 2 and n.reports[-1][0] == "Uptime Kuma monitors"
+
+
+def test_kuma_reports_missing_setup_once(tmp_path):
+    kuma = FakeKuma(notifications=[], docker_hosts=[{"id": 1, "name": "docker1"}])
+    sync, n = kuma_sync(tmp_path, kuma, {"docker1": [], "docker2": [{"name": "x", "kind": "agent"}]})
+    lines = sync.run_once()
+    assert any("no notification called 'Discord'" in l for l in lines)
+    assert any("no Docker host called 'docker2'" in l for l in lines)
+    sync.run_once()
+    assert [r[0] for r in n.reports] == ["Uptime Kuma sync"]  # reported once, not every sync
+    assert kuma.added == []

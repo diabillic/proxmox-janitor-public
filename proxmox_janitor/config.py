@@ -78,6 +78,16 @@ class Config:
     storage_max_percent: int = 90  # never grow into a storage beyond this
     disk_minutes: int = 15
 
+    # Uptime Kuma: a Docker container monitor for every agent (unset KUMA_URL turns it off)
+    kuma_url: str = ""
+    kuma_username: str = ""
+    kuma_password: str = ""
+    kuma_notification: str = "Discord"  # the notification every monitor gets, by name
+    kuma_docker_hosts: dict[str, str] = field(default_factory=dict)  # docker host -> its name in Uptime Kuma
+    kuma_sync_minutes: int = 10
+    kuma_interval: int = 60
+    kuma_retries: int = 1
+
     state_path: str = "/var/lib/proxmox-janitor/state.json"
     notify_urls: list[str] = field(default_factory=list)
     renotify_hours: int = 24
@@ -127,6 +137,14 @@ class Config:
             grow_max_gb=min(999, max(1, _int("GROW_MAX_GB", 50))),
             storage_max_percent=min(99, max(50, _int("STORAGE_MAX_PERCENT", 90))),
             disk_minutes=max(5, _int("DISK_MINUTES", 15)),
+            kuma_url=os.environ.get("KUMA_URL", "").strip().rstrip("/"),
+            kuma_username=os.environ.get("KUMA_USERNAME", "").strip(),
+            kuma_password=os.environ.get("KUMA_PASSWORD", ""),
+            kuma_notification=os.environ.get("KUMA_NOTIFICATION", "").strip() or "Discord",
+            kuma_docker_hosts=_pairs("KUMA_DOCKER_HOSTS", "docker1=docker1"),
+            kuma_sync_minutes=max(1, _int("KUMA_SYNC_MINUTES", 10)),
+            kuma_interval=max(20, _int("KUMA_INTERVAL", 60)),
+            kuma_retries=max(0, _int("KUMA_RETRIES", 1)),
             state_path=os.environ.get("STATE_PATH", "/var/lib/proxmox-janitor/state.json"),
             notify_urls=_list("NOTIFY_URLS"),
             renotify_hours=_int("RENOTIFY_HOURS", 24),
