@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from .bus import Approvals, BusTool, Runtime, schema, serve_mcp
 from .config import Config
 from .janitor import Janitor, schedule_due
+from .kuma import KumaSync
 from .monitor import Monitor
 from .notify import Notifier
 from .pve import Cluster, Remote
@@ -88,9 +89,12 @@ def main() -> None:
              cfg.check_time, cfg.window_day, cfg.window_time, cfg.reboot_guests, cfg.reboot_nodes, cfg.redeploy,
              cfg.cpu_percent, cfg.mem_percent, cfg.sustain_minutes, cfg.disk_percent, cfg.disk_target_percent,
              bool(cfg.bus_token), approvals.enabled, approvals.mode)
+    log.info("Uptime Kuma: %s", f"{cfg.kuma_url} every {cfg.kuma_sync_minutes} min" if cfg.kuma_url else "off")
 
     threading.Thread(target=janitor.worker, name="janitor-worker", daemon=True).start()
     threading.Thread(target=monitor.loop, name="janitor-monitor", daemon=True).start()
+    if cfg.kuma_url and cfg.docker_hosts:
+        threading.Thread(target=KumaSync(docker, cfg, notifier, state).loop, name="janitor-kuma", daemon=True).start()
     win = state["window"]
     if win.get("steps") and not win.get("finished"):
         if time.time() - (win.get("started") or 0) < STALE_WINDOW_HOURS * 3600:

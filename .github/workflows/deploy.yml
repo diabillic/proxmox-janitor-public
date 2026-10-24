@@ -81,6 +81,14 @@ jobs:
           AGENT_BUS_PORT: ${{ vars.AGENT_BUS_PORT }}
           BOT_ALERT_URL: ${{ vars.BOT_ALERT_URL }}
           APPROVAL_MODE: ${{ vars.APPROVAL_MODE }}
+          KUMA_URL: ${{ vars.KUMA_URL }}
+          KUMA_USERNAME: ${{ vars.KUMA_USERNAME }}
+          KUMA_NOTIFICATION: ${{ vars.KUMA_NOTIFICATION }}
+          KUMA_DOCKER_HOSTS: ${{ vars.KUMA_DOCKER_HOSTS }}
+          KUMA_SYNC_MINUTES: ${{ vars.KUMA_SYNC_MINUTES }}
+          KUMA_INTERVAL: ${{ vars.KUMA_INTERVAL }}
+          KUMA_RETRIES: ${{ vars.KUMA_RETRIES }}
+          KUMA_PASSWORD: ${{ secrets.KUMA_PASSWORD }}
           AGENT_BUS_TOKEN: ${{ secrets.AGENT_BUS_TOKEN }}
           APPROVAL_NOTIFY_URLS: ${{ secrets.APPROVAL_NOTIFY_URLS }}
           NOTIFY_URLS: ${{ secrets.NOTIFY_URLS }}
@@ -97,7 +105,9 @@ jobs:
                    EXCLUDE_GUESTS CPU_PERCENT MEM_PERCENT SUSTAIN_MINUTES MONITOR_SECONDS DISK_PERCENT \
                    DISK_TARGET_PERCENT GROW_MIN_GB GROW_MAX_GB STORAGE_MAX_PERCENT DISK_MINUTES \
                    RENOTIFY_HOURS AGENT_BUS_PORT BOT_ALERT_URL APPROVAL_MODE AGENT_BUS_TOKEN \
-                   APPROVAL_NOTIFY_URLS NOTIFY_URLS; do
+                   APPROVAL_NOTIFY_URLS NOTIFY_URLS \
+                   KUMA_URL KUMA_USERNAME KUMA_NOTIFICATION KUMA_DOCKER_HOSTS KUMA_SYNC_MINUTES \
+                   KUMA_INTERVAL KUMA_RETRIES KUMA_PASSWORD; do
             if [ -n "${!v}" ]; then printf '%s=%s\n' "$v" "${!v}" >> stage/agent.env; fi
           done
           publish=""
