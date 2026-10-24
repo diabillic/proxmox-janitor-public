@@ -56,6 +56,13 @@ echo "$DISCORD_WEBHOOK" | docker exec -i proxmox-janitor python -m proxmox_janit
 
 The account must not use 2FA; the janitor logs in with a username and password.
 
+The janitor's own container has a Docker health check (`python -m proxmox_janitor.health`), so its monitor
+reports more than "running". It turns `unhealthy` when one of its loops stops coming round: the scheduler
+(every 30 s), the health monitor (`MONITOR_SECONDS` plus 15 min), the Uptime Kuma sync
+(`KUMA_SYNC_MINUTES` plus 10 min), or the job worker (idle, or a job running over 12 h), or when the
+agent bus stops answering `/health`. `docker inspect --format '{{json .State.Health}}' proxmox-janitor`
+shows why.
+
 ## How it reaches the cluster
 
 It holds one SSH key and no Proxmox API token.

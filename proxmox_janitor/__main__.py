@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from . import health
 from .bus import Approvals, BusTool, Runtime, schema, serve_mcp
 from .config import Config
 from .janitor import Janitor, schedule_due
@@ -80,9 +81,11 @@ def main() -> None:
         return
 
     approvals = Approvals("janitor", cfg.approval_urls, mode=cfg.approval_mode)
+    health.reset()
     if cfg.bus_token and cfg.bus_port:
         serve_mcp("0.0.0.0", cfg.bus_port, cfg.bus_token, bus_tools(janitor, monitor, runtime), "proxmox-janitor",
                   approvals)
+        health.endpoint("agent bus", f"http://127.0.0.1:{cfg.bus_port}/health")
     log.info("Starting: nodes=%s docker_hosts=%s self=%s tz=%s check=%s window=%s %s reboot_guests=%s "
              "reboot_nodes=%s redeploy=%s cpu/mem=%s/%s%% for %smin disk=%s%%->%s%% bus=%s approvals=%s/%s",
              ",".join(cfg.nodes), ",".join(cfg.docker_hosts) or "-", cfg.self_guest or "-", cfg.timezone,
@@ -109,6 +112,7 @@ def main() -> None:
         janitor.submit("check", [], "startup")
     last = state["schedule"]
     while True:
+        health.beat("scheduler", 120)
         if runtime.wake.wait(30):  # the assistant asked for a check now
             runtime.wake.clear()
             janitor.submit("check", [], "agent bus")
