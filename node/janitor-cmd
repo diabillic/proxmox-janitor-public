@@ -1,0 +1,502 @@
+#!/usr/bin/python3
+"""Forced command for the Proxmox janitor's SSH key on every Proxmox node.
+
+authorized_keys pins the janitor's key to this script (command="...",restrict), so the janitor
+can ask for exactly these things and nothing else. Each prints one JSON object on stdout:
+
+  inventory                       every guest and node in the cluster: status, tags, CPU, memory
+  node-check                      apt update, pending upgrades and whether this node needs a reboot
+  node-patch                      apt full-upgrade on this node (refused unless the cluster is quorate)
+  node-reboot                     reboot this node in 20s (refused unless quorate with every node online)
+  guest-check VMID                updates and restart facts for a running guest on this node
+  guest-snapshot VMID KEEP        snapshot prepatch-<UTC time>; keep only the newest KEEP prepatch snapshots
+  guest-delsnapshot VMID NAME     delete one of those prepatch snapshots (after a successful patch)
+  guest-patch VMID                apt full-upgrade inside the guest
+  guest-reboot VMID               restart a guest, detached (it completes even if the caller goes away)
+  guest-status VMID               whether it's running (and, for a VM, whether its guest agent answers)
+  guest-start VMID                start a stopped guest (after a node reboot)
+  guest-disks VMID                each volume: size, storage, and the filesystems on it with their usage
+  guest-grow VMID DISK GB MAXPCT  add GB to a volume and grow the filesystem on it, unless that would
+                                  take the volume's storage past MAXPCT percent used
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+SNAPSHOT_PREFIX = "prepatch-"
+GIB = 1024 ** 3
+GROWABLE_FS = ("ext4", "xfs", "btrfs")
+APT_UPGRADE = ("apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "
+               "-o DPkg::Lock::Timeout=300 full-upgrade")
+
+# Runs inside a guest (POSIX sh). Markers start with @@ so they can't be confused with apt output.
+CHECK_SH = r"""
+export DEBIAN_FRONTEND=noninteractive LC_ALL=C
+command -v apt-get >/dev/null 2>&1 || { echo "@@UNSUPPORTED"; exit 0; }
+apt-get update -q >/tmp/.janitor-update 2>&1; echo "@@UPDATE_RC $?"
+grep -E '^(E|Err):' /tmp/.janitor-update | head -5 | sed 's/^/@@UPDATE_ERR /'
+apt-get -s -o Debug::NoLocking=1 full-upgrade 2>/dev/null | grep -E '^(Inst|Remv) '
+[ -e /run/reboot-required ] && echo "@@REBOOT_FILE"
+for d in /proc/[0-9]*; do
+  grep -E ' \(deleted\)$' "$d/maps" 2>/dev/null | grep -qE '\.so|/usr/(lib|bin|sbin|libexec)/' && echo "@@STALE $(cat "$d/comm" 2>/dev/null)"
+done | sort -u | head -20
+echo "@@KERNEL $(uname -r) $(ls /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | sort -V | tail -1)"
+"""
+
+PATCH_SH = r"""
+export DEBIAN_FRONTEND=noninteractive LC_ALL=C
+apt-get update -q >/dev/null 2>&1
+%s >/tmp/.janitor-upgrade 2>&1; rc=$?
+tail -40 /tmp/.janitor-upgrade
+echo "@@RC $rc"
+""" % APT_UPGRADE
+
+# Partitions inside a VM: name, start sector, parent disk. A partition can only grow into free
+# space after it, so only the one that starts last on its disk is growable.
+PARTITIONS_SH = r"""
+for p in /sys/class/block/*/partition; do
+  d=${p%/partition}
+  echo "@@PART $(basename "$d") $(cat "$d/start") $(basename "$(readlink -f "$d/..")")"
+done
+"""
+
+GROW_SH = r"""
+export DEBIAN_FRONTEND=noninteractive LC_ALL=C
+disk=%(disk)s; part=%(part)s; dev=%(dev)s; fstype=%(fstype)s; mnt=%(mnt)s
+[ -w "/sys/class/block/$disk/device/rescan" ] && echo 1 > "/sys/class/block/$disk/device/rescan"
+if [ -n "$part" ]; then
+  command -v growpart >/dev/null 2>&1 || { apt-get update -q >/dev/null 2>&1; apt-get install -y -q cloud-guest-utils >/dev/null 2>&1; }
+  growpart "/dev/$disk" "$part"; rc=$?
+  [ $rc -le 1 ] || { echo "@@FAIL growpart exited $rc"; exit 0; }
+fi
+case "$fstype" in
+  ext4) resize2fs "$dev" ;;
+  xfs) xfs_growfs "$mnt" ;;
+  btrfs) btrfs filesystem resize max "$mnt" ;;
+esac || { echo "@@FAIL growing the $fstype filesystem failed"; exit 0; }
+echo "@@GREW"
+"""
+
+
+class Refused(Exception):
+    pass
+
+
+def run(cmd: list[str], timeout: int = 600) -> tuple[int, str]:
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, "LC_ALL": "C", "DEBIAN_FRONTEND": "noninteractive"})
+    return p.returncode, p.stdout + p.stderr
+
+
+def pvesh(path: str, timeout: int = 60):
+    rc, out = run(["pvesh", "get", path, "--output-format", "json"], timeout)
+    if rc != 0:
+        raise Refused(f"pvesh {path} failed: {out.strip()[-300:]}")
+    return json.loads(out)
+
+
+def parse_check(out: str, is_vm: bool) -> dict:
+    """Turn CHECK_SH output into updates and restart facts."""
+    if "@@UNSUPPORTED" in out:
+        return {"supported": False, "updates": [], "removals": [], "restart_needed": False, "reasons": []}
+    updates, removals, reasons, stale, errors = [], [], [], [], []
+    update_rc = 0
+    for line in out.splitlines():
+        m = re.match(r"^Inst (\S+) (?:\[(\S+)\] )?\((\S+) (.*?)\)", line)
+        if m:
+            updates.append({"pkg": m.group(1), "from": m.group(2), "to": m.group(3),
+                            "security": "-security" in m.group(4) or "Debian-Security" in m.group(4)})
+        elif line.startswith("Remv "):
+            removals.append(line.split()[1])
+        elif line.startswith("@@UPDATE_RC "):
+            update_rc = int(line.split()[1])
+        elif line.startswith("@@UPDATE_ERR "):
+            errors.append(line[len("@@UPDATE_ERR "):].strip())
+        elif line == "@@REBOOT_FILE":
+            reasons.append("/run/reboot-required is set")
+        elif line.startswith("@@STALE "):
+            stale.append(line[len("@@STALE "):].strip())
+        elif line.startswith("@@KERNEL "):
+            parts = line.split()[1:]
+            running, newest = (parts + ["", ""])[:2]
+            if is_vm and newest and running and newest != running:
+                reasons.append(f"running kernel {running}, newest installed {newest}")
+    if stale:
+        reasons.append("processes still use replaced libraries: " + ", ".join(stale[:8]))
+    return {"supported": True, "updates": updates, "removals": removals, "restart_needed": bool(reasons),
+            "reasons": reasons,
+            "update_error": "; ".join(errors) or (f"apt-get update exited {update_rc}" if update_rc else "")}
+
+
+def version_key(version: str) -> list[tuple[int, int | str]]:
+    return [(0, int(x)) if x.isdigit() else (1, x) for x in re.split(r"[.-]", version)]
+
+
+def size_bytes(text: str) -> int:
+    """Proxmox volume sizes: 10G, 512M, 1T, 4096K or plain bytes."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGT]?)", text.strip())
+    if not m:
+        return 0
+    return int(float(m.group(1)) * {"": 1, "K": 1024, "M": 1024 ** 2, "G": GIB, "T": 1024 ** 4}[m.group(2)])
+
+
+def quorum() -> tuple[bool, list[str]]:
+    """Whether the cluster is quorate, and which nodes are offline."""
+    rc, out = run(["pvecm", "status"], 60)
+    quorate = bool(re.search(r"^Quorate:\s+Yes", out, re.M))
+    offline = [n["name"] for n in pvesh("/cluster/status") if n.get("type") == "node" and not n.get("online")]
+    return quorate, offline
+
+
+# --- guests on this node ---
+
+def guest_type(vmid: str) -> str:
+    if os.path.exists(f"/etc/pve/local/lxc/{vmid}.conf"):
+        return "lxc"
+    if os.path.exists(f"/etc/pve/local/qemu-server/{vmid}.conf"):
+        return "qemu"
+    raise Refused(f"guest {vmid} is not on node {socket.gethostname()}")
+
+
+def tool(kind: str) -> str:
+    return "pct" if kind == "lxc" else "qm"
+
+
+def guest_running(vmid: str, kind: str) -> bool:
+    rc, out = run([tool(kind), "status", vmid], 30)
+    return rc == 0 and "status: running" in out
+
+
+def guest_config(vmid: str, kind: str) -> dict[str, str]:
+    rc, out = run([tool(kind), "config", vmid], 30)
+    if rc != 0:
+        raise Refused(f"couldn't read the config of {vmid}: {out.strip()[-200:]}")
+    cfg = {}
+    for line in out.splitlines():
+        if line.startswith("["):  # snapshot sections follow the current config
+            break
+        k, sep, v = line.partition(": ")
+        if sep:
+            cfg[k] = v
+    return cfg
+
+
+def in_guest(vmid: str, kind: str, script: str, timeout: int) -> str:
+    if kind == "lxc":
+        rc, out = run(["pct", "exec", vmid, "--", "sh", "-c", script], timeout)
+        if rc != 0 and "@@" not in out:
+            raise Refused(f"pct exec failed: {out.strip()[-300:]}")
+        return out
+    rc, out = run(["qm", "agent", vmid, "ping"], 30)
+    if rc != 0:
+        raise Refused("the QEMU guest agent isn't responding (install/enable qemu-guest-agent in the VM)")
+    rc, out = run(["qm", "guest", "exec", vmid, "--timeout", str(timeout), "--", "sh", "-c", script], timeout + 30)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        raise Refused(f"qm guest exec failed: {out.strip()[-300:]}")
+    return (data.get("out-data") or "") + (data.get("err-data") or "")
+
+
+def guest_check(vmid: str) -> dict:
+    kind = guest_type(vmid)
+    if not guest_running(vmid, kind):
+        return {"vmid": vmid, "type": kind, "running": False}
+    return {"vmid": vmid, "type": kind, "running": True, **parse_check(in_guest(vmid, kind, CHECK_SH, 900), kind == "qemu")}
+
+
+def guest_patch(vmid: str) -> dict:
+    kind = guest_type(vmid)
+    if not guest_running(vmid, kind):
+        raise Refused(f"guest {vmid} is not running")
+    out = in_guest(vmid, kind, PATCH_SH, 3600)
+    m = re.search(r"^@@RC (\d+)", out, re.M)
+    rc = int(m.group(1)) if m else -1
+    return {"vmid": vmid, "ok": rc == 0, "rc": rc, "log": out.split("@@RC")[0].strip()[-3000:]}
+
+
+def guest_snapshot(vmid: str, keep: str) -> dict:
+    kind = guest_type(vmid)
+    name = SNAPSHOT_PREFIX + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    rc, out = run([tool(kind), "snapshot", vmid, name, "--description", "Taken by the Proxmox janitor before patching"], 600)
+    if rc != 0:
+        raise Refused(f"snapshot failed: {out.strip()[-300:]}")
+    snaps = pvesh(f"/nodes/{socket.gethostname()}/{kind}/{vmid}/snapshot")
+    ours = sorted(s["name"] for s in snaps if s.get("name", "").startswith(SNAPSHOT_PREFIX))
+    deleted = []
+    for old in ours[:-int(keep)]:
+        if run([tool(kind), "delsnapshot", vmid, old], 600)[0] == 0:
+            deleted.append(old)
+    return {"vmid": vmid, "snapshot": name, "deleted": deleted}
+
+
+def guest_delsnapshot(vmid: str, name: str) -> dict:
+    kind = guest_type(vmid)
+    rc, out = run([tool(kind), "delsnapshot", vmid, name], 600)
+    if rc != 0:
+        raise Refused(f"deleting snapshot {name} failed: {out.strip()[-300:]}")
+    return {"vmid": vmid, "deleted": name}
+
+
+def guest_reboot(vmid: str) -> dict:
+    """Detached in its own unit: the janitor may be inside this very guest."""
+    kind = guest_type(vmid)
+    if not guest_running(vmid, kind):
+        raise Refused(f"guest {vmid} is not running")
+    rc, out = run(["systemd-run", f"--unit=janitor-reboot-{vmid}-{int(time.time())}", "--collect", "--quiet",
+                   tool(kind), "reboot", vmid, "--timeout", "300"], 60)
+    if rc != 0:
+        raise Refused(f"couldn't start the reboot: {out.strip()[-300:]}")
+    return {"vmid": vmid, "rebooting": True}
+
+
+def guest_status(vmid: str) -> dict:
+    kind = guest_type(vmid)
+    running = guest_running(vmid, kind)
+    agent = kind == "qemu" and running and run(["qm", "agent", vmid, "ping"], 30)[0] == 0
+    return {"vmid": vmid, "type": kind, "running": running, "agent": agent}
+
+
+def guest_start(vmid: str) -> dict:
+    kind = guest_type(vmid)
+    if guest_running(vmid, kind):
+        return {"vmid": vmid, "started": False, "running": True}
+    rc, out = run([tool(kind), "start", vmid], 300)
+    if rc != 0:
+        raise Refused(f"start failed: {out.strip()[-300:]}")
+    return {"vmid": vmid, "started": True, "running": True}
+
+
+# --- disks ---
+
+DISK_KEY = r"rootfs|mp\d{1,2}|(?:scsi|virtio|sata|ide)\d{1,2}"
+
+
+def _volumes(vmid: str, kind: str) -> dict[str, dict]:
+    """Resizable volumes from the config: key -> volume, storage, size, mount (LXC)."""
+    out = {}
+    for key, val in guest_config(vmid, kind).items():
+        if not re.fullmatch(DISK_KEY, key):
+            continue
+        volid, *opts = val.split(",")
+        o = dict(x.split("=", 1) for x in opts if "=" in x)
+        if ":" not in volid or volid.startswith("/") or o.get("media") == "cdrom" or "cloudinit" in volid:
+            continue  # bind mounts, CD/DVD drives and cloud-init drives can't be grown
+        out[key] = {"disk": key, "volume": volid, "storage": volid.split(":", 1)[0],
+                    "size": size_bytes(o.get("size", "0")), "mount": "/" if key == "rootfs" else o.get("mp", ""),
+                    "filesystems": []}
+    return out
+
+
+def _storage(storage: str) -> dict:
+    st = pvesh(f"/nodes/{socket.gethostname()}/storage/{storage}/status")
+    return {"used": int(st.get("used") or 0), "total": int(st.get("total") or 0)}
+
+
+def _vm_filesystems(vmid: str) -> list[dict]:
+    """The guest agent's filesystems, each tied to its Proxmox disk through the drive serial."""
+    rc, out = run(["qm", "guest", "cmd", vmid, "get-fsinfo"], 60)
+    if rc != 0:
+        raise Refused(f"the guest agent didn't list filesystems: {out.strip()[-200:]}")
+    starts: dict[str, tuple[int, str]] = {}
+    for line in in_guest(vmid, "qemu", PARTITIONS_SH, 60).splitlines():
+        p = line.split()
+        if len(p) == 4 and p[0] == "@@PART" and p[2].isdigit():
+            starts[p[1]] = (int(p[2]), p[3])
+    last_on_disk: dict[str, str] = {}
+    for name, (start, parent) in starts.items():
+        if parent not in last_on_disk or start > starts[last_on_disk[parent]][0]:
+            last_on_disk[parent] = name
+    result = []
+    for fs in json.loads(out):
+        disks = fs.get("disk") or []
+        m = re.search(r"drive-(" + DISK_KEY + r")$", (disks[0].get("serial") or "") if len(disks) == 1 else "")
+        name = fs.get("name", "")
+        parent = starts.get(name, (0, name))[1]
+        part = name[len(parent):].lstrip("p") if name in starts else ""
+        growable = (m is not None and fs.get("type") in GROWABLE_FS and fs.get("total-bytes")
+                    and (name not in starts or last_on_disk.get(parent) == name))
+        result.append({"disk": m.group(1) if m else None, "mount": fs.get("mountpoint"), "type": fs.get("type"),
+                       "dev": f"/dev/{name}", "parent": parent, "part": part,
+                       "used": fs.get("used-bytes"), "total": fs.get("total-bytes"), "growable": bool(growable)})
+    return result
+
+
+def _lxc_filesystems(vmid: str, volumes: dict[str, dict]) -> None:
+    keys = [k for k, v in volumes.items() if v["mount"]]
+    out = in_guest(vmid, "lxc", "df -P -B1 " + " ".join(f"'{volumes[k]['mount']}'" for k in keys), 60)
+    rows = [l.split() for l in out.splitlines()[1:] if l.strip()]
+    for key, row in zip(keys, rows):
+        if len(row) >= 6 and row[1].isdigit() and row[2].isdigit():
+            volumes[key]["filesystems"].append({"mount": volumes[key]["mount"], "type": "lxc", "used": int(row[2]),
+                                                "total": int(row[1]), "growable": True})
+
+
+def guest_disks(vmid: str) -> dict:
+    kind = guest_type(vmid)
+    if not guest_running(vmid, kind):
+        return {"vmid": vmid, "type": kind, "running": False, "volumes": []}
+    volumes = _volumes(vmid, kind)
+    if kind == "lxc":
+        _lxc_filesystems(vmid, volumes)
+    else:
+        for fs in _vm_filesystems(vmid):
+            if fs["disk"] in volumes:
+                volumes[fs["disk"]]["filesystems"].append(fs)
+    for v in volumes.values():
+        v.update({"storage_" + k: x for k, x in _storage(v["storage"]).items()})
+    return {"vmid": vmid, "type": kind, "running": True, "volumes": list(volumes.values())}
+
+
+def guest_grow(vmid: str, disk: str, gb: str, maxpct: str) -> dict:
+    kind = guest_type(vmid)
+    volumes = _volumes(vmid, kind)
+    if disk not in volumes:
+        raise Refused(f"{vmid} has no resizable volume {disk}")
+    vol, add = volumes[disk], int(gb) * GIB
+    st = _storage(vol["storage"])
+    if not st["total"] or (st["used"] + add) * 100 / st["total"] > int(maxpct):
+        raise Refused(f"storage {vol['storage']} would be over {maxpct}% used after adding {gb} GB")
+    target = None
+    if kind == "qemu":
+        targets = [f for f in _vm_filesystems(vmid) if f["disk"] == disk and f["growable"]]
+        if len(targets) != 1:
+            raise Refused(f"no single growable filesystem on {disk} (LVM, an unsupported filesystem, or more than one)")
+        target = targets[0]
+        # These go into a shell script inside the VM: only plain device and path names.
+        if not (re.fullmatch(r"[a-z0-9]+", target["parent"]) and re.fullmatch(r"[0-9]*", target["part"])
+                and re.fullmatch(r"/dev/[a-z0-9]+", target["dev"]) and re.fullmatch(r"/[\w./-]*", target["mount"] or "")):
+            raise Refused("unexpected device or mount names; not growing")
+    resize = ["pct", "resize"] if kind == "lxc" else ["qm", "disk", "resize"]
+    rc, out = run([*resize, vmid, disk, f"+{gb}G"], 900)
+    if rc != 0:
+        raise Refused(f"resizing {disk} failed: {out.strip()[-300:]}")
+    if kind == "qemu":
+        out = in_guest(vmid, "qemu", GROW_SH % {"disk": target["parent"], "part": target["part"] or "''",
+                                                "dev": target["dev"], "fstype": target["type"],
+                                                "mnt": target["mount"]}, 600)
+        if "@@GREW" not in out:
+            fail = re.search(r"^@@FAIL (.*)$", out, re.M)
+            raise Refused(f"the volume grew by {gb} GB but the filesystem didn't: "
+                          f"{fail.group(1) if fail else out.strip()[-300:]}")
+    return {"vmid": vmid, "disk": disk, "added_gb": int(gb), **guest_disks(vmid)}
+
+
+# --- this node ---
+
+def node_reboot_reasons() -> list[str]:
+    reasons = []
+    if os.path.exists("/run/reboot-required"):
+        reasons.append("/run/reboot-required is set")
+    running = os.uname().release
+    rc, out = run(["proxmox-boot-tool", "kernel", "list"], 60)
+    pinned = re.search(r"^Pinned kernel:\s*\n\s*(\S+)", out, re.M) if rc == 0 else None
+    target = pinned.group(1) if pinned else None
+    if not target:
+        kernels = sorted((f[len("vmlinuz-"):] for f in os.listdir("/boot") if f.startswith("vmlinuz-") and f.endswith("-pve")),
+                         key=version_key)
+        target = kernels[-1] if kernels else None
+    if target and target != running:
+        reasons.append(f"running kernel {running}, {'pinned' if pinned else 'newest installed'} {target}")
+    return reasons
+
+
+def node_check() -> dict:
+    rc, out = run(["sh", "-c", CHECK_SH], 900)
+    facts = parse_check(out, is_vm=False)
+    reasons = node_reboot_reasons()
+    facts.update({"node": socket.gethostname(), "reasons": reasons, "restart_needed": bool(reasons)})
+    return facts
+
+
+def node_patch() -> dict:
+    quorate, _ = quorum()
+    if not quorate:
+        raise Refused("the cluster is not quorate; not patching a node now")
+    rc, out = run(["systemd-run", "--unit=janitor-upgrade", "--collect", "--wait", "--pipe", "--quiet",
+                   "sh", "-c", PATCH_SH], 3600)
+    m = re.search(r"^@@RC (\d+)", out, re.M)
+    code = int(m.group(1)) if m else rc or -1
+    return {"node": socket.gethostname(), "ok": code == 0, "rc": code, "log": out.split("@@RC")[0].strip()[-3000:],
+            "reasons": node_reboot_reasons()}
+
+
+def node_reboot() -> dict:
+    quorate, offline = quorum()
+    if not quorate or offline:
+        raise Refused("not rebooting: the cluster must be quorate with every node online "
+                      f"(offline: {', '.join(offline) or 'none'})")
+    rc, out = run(["systemd-run", "--on-active=20", "--unit=janitor-node-reboot", "--collect", "--quiet",
+                   "systemctl", "reboot"], 60)
+    if rc != 0:
+        raise Refused(f"couldn't schedule the reboot: {out.strip()[-300:]}")
+    return {"node": socket.gethostname(), "rebooting": True, "in_seconds": 20}
+
+
+def inventory() -> dict:
+    keep = ("vmid", "name", "node", "type", "status", "tags", "template", "cpu", "maxcpu", "mem", "maxmem", "uptime")
+    guests = [{k: r.get(k) for k in keep} for r in _resources("vm")]
+    nodes = [{k: r.get(k) for k in ("node", "status", "cpu", "maxcpu", "mem", "maxmem", "uptime")}
+             for r in _resources("node")]
+    quorate, offline = quorum()
+    return {"node": socket.gethostname(), "quorate": quorate, "offline": offline, "guests": guests, "nodes": nodes}
+
+
+def _resources(kind: str) -> list[dict]:
+    rc, out = run(["pvesh", "get", "/cluster/resources", "--type", kind, "--output-format", "json"], 60)
+    if rc != 0:
+        raise Refused(f"pvesh failed: {out.strip()[-300:]}")
+    return json.loads(out)
+
+
+VMID = r"[1-9]\d{2,8}"
+# request -> (function, a full-match pattern per argument)
+COMMANDS = {
+    "inventory": (inventory, []),
+    "node-check": (node_check, []),
+    "node-patch": (node_patch, []),
+    "node-reboot": (node_reboot, []),
+    "guest-check": (guest_check, [VMID]),
+    "guest-snapshot": (guest_snapshot, [VMID, r"[1-9]"]),
+    "guest-delsnapshot": (guest_delsnapshot, [VMID, re.escape(SNAPSHOT_PREFIX) + r"\d{8}-\d{6}"]),  # only its own
+    "guest-patch": (guest_patch, [VMID]),
+    "guest-reboot": (guest_reboot, [VMID]),
+    "guest-status": (guest_status, [VMID]),
+    "guest-start": (guest_start, [VMID]),
+    "guest-disks": (guest_disks, [VMID]),
+    "guest-grow": (guest_grow, [VMID, DISK_KEY, r"[1-9]\d{0,2}", r"[5-9]\d"]),  # 1-999 GB; 50-99 %
+}
+
+
+def dispatch(command_line: str) -> dict:
+    words = command_line.split()
+    if not words or words[0] not in COMMANDS:
+        raise Refused(f"unknown request {words[0] if words else '(empty)'!r}")
+    fn, patterns = COMMANDS[words[0]]
+    args = words[1:]
+    if len(args) != len(patterns) or not all(re.fullmatch(p, a) for p, a in zip(patterns, args)):
+        raise Refused(f"bad arguments for {words[0]}")
+    return fn(*args)
+
+
+def main() -> int:
+    try:
+        result, code = dispatch(os.environ.get("SSH_ORIGINAL_COMMAND", " ".join(sys.argv[1:]))), 0
+    except Refused as exc:
+        result, code = {"error": str(exc)}, 1
+    except subprocess.TimeoutExpired as exc:
+        result, code = {"error": f"timed out after {exc.timeout}s"}, 1
+    print(json.dumps(result))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

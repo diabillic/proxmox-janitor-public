@@ -1,0 +1,2 @@
+# Scripts run on Linux (Proxmox, LXCs, runner); never check them out with CRLF.
+* text=auto eol=lf
