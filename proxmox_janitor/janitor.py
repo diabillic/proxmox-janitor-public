@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from . import health
 from .config import DAYS, Config
 from .findings import Finding
 from .notify import PENDING, PROBLEMS, RESTART, SKIPPED, Notifier, is_health
@@ -32,6 +33,7 @@ KIND_LABEL = {"lxc": "CT", "qemu": "VM"}
 WAIT_GUEST = 600  # seconds for a restarted guest to run again
 WAIT_NODE = 1800  # for a rebooted node to rejoin
 WAIT_REDEPLOY = 5400  # for every agent on a Docker host to be rebuilt
+JOB_HOURS = 12  # longest any job (a whole maintenance window) may run before the container counts as unhealthy
 
 
 @dataclass
@@ -519,7 +521,13 @@ class Janitor:
 
     def worker(self) -> None:
         while True:
-            self.run_job(self.queue.get())
+            health.beat("job worker", 120)
+            try:
+                job = self.queue.get(timeout=60)
+            except queue.Empty:
+                continue
+            health.beat("job worker", JOB_HOURS * 3600)  # a whole maintenance window is one job
+            self.run_job(job)
 
     # --- agent bus ---
 

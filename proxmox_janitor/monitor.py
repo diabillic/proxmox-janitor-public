@@ -16,6 +16,7 @@ import logging
 import math
 import time
 
+from . import health
 from .config import Config
 from .findings import Finding
 from .notify import CPU, DISK, MEM, Notifier, is_health
@@ -27,6 +28,7 @@ log = logging.getLogger(__name__)
 GIB = 1024 ** 3
 KIND_LABEL = {"lxc": "CT", "qemu": "VM"}
 GROW_COOLDOWN = 3600  # don't grow the same volume again within this
+PASS_GRACE = 15 * 60  # longest a pass (every node and guest, plus any disk growth) should take
 
 
 def grow_gb(used: int, total: int, target_percent: int, min_gb: int, max_gb: int) -> int:
@@ -173,6 +175,7 @@ class Monitor:
 
     def loop(self) -> None:
         while True:
+            health.beat("monitor", self.cfg.monitor_seconds + PASS_GRACE)
             try:
                 self.run_once()
             except Exception:  # keep monitoring

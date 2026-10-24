@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 
+from . import health
 from .config import Config
 from .pve import Remote, RemoteError
 
@@ -176,6 +177,7 @@ class KumaSync:
 
     def loop(self) -> None:
         while True:
+            health.beat("kuma sync", self.cfg.kuma_sync_minutes * 60 + 10 * 60)
             try:
                 self.run_once()
             except Exception:  # keep syncing
