@@ -1,0 +1,10 @@
+# secrets and runtime state
+.env
+data/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
