@@ -6,7 +6,7 @@ Keeps a Proxmox VE cluster patched, healthy and roomy:
   maintenance window, with restarts and reboots where updates need them.
 - **Container rebuilds:** every agent container on the Docker hosts is rebuilt in the same window,
   so each image gets a fresh base and a full OS upgrade.
-- **CPU and RAM:** alerts when a node or guest stays above a threshold.
+- **CPU and RAM:** a guest that stays busy gets more cores or memory; a node that does is alerted.
 - **Disks:** volumes are grown, along with the filesystem inside the guest, before they fill up.
 
 ## What it does
@@ -15,7 +15,7 @@ Keeps a Proxmox VE cluster patched, healthy and roomy:
 |---|---|
 | Daily at `CHECK_TIME` (07:00) | Checks every node and running guest for updates and needed restarts, and reports anything new. |
 | Weekly at `WINDOW_DAY` `WINDOW_TIME` (Sun 03:00) | The maintenance window, three phases one step at a time: **1.** every guest gets a pre-patch snapshot, `apt full-upgrade`, a restart if it needs one, then the snapshot is deleted. **2.** Every Docker host rebuilds every agent container. **3.** Every node gets `apt full-upgrade`, then a reboot if needed. A summary is posted at the end. |
-| Every `MONITOR_SECONDS` (60) | CPU and RAM of every node and running guest. Above `CPU_PERCENT` / `MEM_PERCENT` (80) for `SUSTAIN_MINUTES` (15) sends an alert, and another when it's back to normal. |
+| Every `MONITOR_SECONDS` (60) | CPU and RAM of every node and running guest. A guest above `CPU_PERCENT` / `MEM_PERCENT` (75) for `SUSTAIN_MINUTES` (15) gets enough cores or memory to bring that load to about `RESIZE_TARGET_PERCENT` (60). A node, or a guest that can't be raised, sends an alert instead, and another when it's back to normal. |
 | Every `DISK_MINUTES` (15) | Every filesystem of every running guest. Above `DISK_PERCENT` (85), the volume grows by enough to bring it back to about `DISK_TARGET_PERCENT` (70), between `GROW_MIN_GB` (5) and `GROW_MAX_GB` (50) at a time, and the filesystem grows with it. |
 
 Guardrails:
@@ -28,6 +28,13 @@ Guardrails:
   grow, never shrink. VMs need the QEMU guest agent, and the filesystem must be ext4, xfs or
   btrfs on the disk's last partition or on the whole disk. LVM inside a VM isn't grown.
   Anything it can't grow is reported instead.
+- **CPU and RAM:** a guest is raised at most once an hour per resource, by at least one core or
+  512 MiB and at most double, up to `RESIZE_MAX_CORES` (8) and `RESIZE_MAX_MEM_GB` (32), never past
+  its node's cores, and never so far that running guests have more than `NODE_MEM_MAX_PERCENT` (90)
+  of the node's RAM. An LXC takes the change live. A VM takes it at its next restart, which the
+  maintenance window does. A VM's RAM is read through its guest agent, because Proxmox counts the
+  guest's page cache as used; a VM without an answering agent has its RAM left alone. Guests with
+  `cpulimit`, `vcpus`, or no core limit (LXC) are reported, not raised. `RESIZE=false` only alerts.
 - **Rebuilds:** a rebuilt container that doesn't stay up is rolled back to the previous one by
   `agent-deploy`.
 - **Exclusions:** `EXCLUDE_GUESTS` (VMIDs or names) are never patched, restarted or resized.
@@ -72,7 +79,7 @@ It holds one SSH key and no Proxmox API token.
 - **Proxmox nodes:** the key is pinned to `node/janitor-cmd`:
   `command="/usr/local/sbin/janitor-cmd",restrict,from="<janitor address>"`. That script accepts a
   fixed set of requests (inventory, checks, patching, snapshots, guest restart/start, disk reports
-  and growth, node reboot) with validated arguments, and nothing else. There's no shell.
+  and growth, raising a guest's cores or memory, node reboot) with validated arguments, and nothing else. There's no shell.
 - **Docker hosts:** the same key is pinned to `agent-redeploy-ssh` on the `deploy` user. It can
   start a rebuild of every agent and read its status, nothing else.
 
@@ -140,7 +147,7 @@ Actions**.
 | variables | `KUMA_NOTIFICATION`, `KUMA_DOCKER_HOSTS`, `KUMA_SYNC_MINUTES`, `KUMA_INTERVAL`, `KUMA_RETRIES` | Optional: notification name (`Discord`), `host=kuma name` mapping, and defaults 10 / 60 / 1. |
 | variable | `TIMEZONE` | IANA zone for the schedule, e.g. `America/New_York` (default `UTC`). |
 | variable | `APPROVAL_MODE` | `client` (assistant buttons) or `code` (default `code`). |
-| variables | `CHECK_TIME`, `WINDOW_DAY`, `WINDOW_TIME`, `WINDOW_HOURS`, `REBOOT_GUESTS`, `REBOOT_NODES`, `REDEPLOY`, `KEEP_SNAPSHOTS`, `SNAPSHOT_KEEP`, `EXCLUDE_GUESTS`, `CPU_PERCENT`, `MEM_PERCENT`, `SUSTAIN_MINUTES`, `MONITOR_SECONDS`, `DISK_PERCENT`, `DISK_TARGET_PERCENT`, `GROW_MIN_GB`, `GROW_MAX_GB`, `STORAGE_MAX_PERCENT`, `DISK_MINUTES`, `RENOTIFY_HOURS`, `AGENT_BUS_PORT`, `BOT_ALERT_URL` | Optional overrides; see `.env.example` for the defaults. |
+| variables | `CHECK_TIME`, `WINDOW_DAY`, `WINDOW_TIME`, `WINDOW_HOURS`, `REBOOT_GUESTS`, `REBOOT_NODES`, `REDEPLOY`, `KEEP_SNAPSHOTS`, `SNAPSHOT_KEEP`, `EXCLUDE_GUESTS`, `CPU_PERCENT`, `MEM_PERCENT`, `SUSTAIN_MINUTES`, `RESIZE`, `RESIZE_TARGET_PERCENT`, `RESIZE_MAX_CORES`, `RESIZE_MAX_MEM_GB`, `NODE_MEM_MAX_PERCENT`, `MONITOR_SECONDS`, `DISK_PERCENT`, `DISK_TARGET_PERCENT`, `GROW_MIN_GB`, `GROW_MAX_GB`, `STORAGE_MAX_PERCENT`, `DISK_MINUTES`, `RENOTIFY_HOURS`, `AGENT_BUS_PORT`, `BOT_ALERT_URL` | Optional overrides; see `.env.example` for the defaults. |
 
 ## Local run
 

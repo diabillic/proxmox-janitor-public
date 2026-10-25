@@ -66,10 +66,15 @@ class Config:
     snapshot_keep: int = 2
     exclude: list[str] = field(default_factory=list)  # VMIDs or names never patched, restarted or resized
 
-    # Health: sustained CPU/RAM alerts, disks grown when they fill up
-    cpu_percent: int = 80
-    mem_percent: int = 80
+    # Health: guests resized when CPU/RAM stay high (nodes alerted), disks grown when they fill up
+    cpu_percent: int = 75
+    mem_percent: int = 75
     sustain_minutes: int = 15
+    resize: bool = True  # false: only alert
+    resize_target_percent: int = 60  # size a guest so the load it had is about this much of the new size
+    resize_max_cores: int = 8  # per guest, and never more than its node has
+    resize_max_mem_gb: int = 32  # per guest
+    node_mem_max_percent: int = 90  # never commit more of a node's RAM than this to running guests
     monitor_seconds: int = 60
     disk_percent: int = 85  # grow a volume once a filesystem on it is this full
     disk_target_percent: int = 70  # ...by enough to bring it back to about this
@@ -110,6 +115,10 @@ class Config:
         target, threshold = _int("DISK_TARGET_PERCENT", 70), _int("DISK_PERCENT", 85)
         if not 10 <= target < threshold <= 99:
             raise SystemExit("need 10 <= DISK_TARGET_PERCENT < DISK_PERCENT <= 99")
+        cpu, mem = min(100, max(1, _int("CPU_PERCENT", 75))), min(100, max(1, _int("MEM_PERCENT", 75)))
+        resize_target = _int("RESIZE_TARGET_PERCENT", 60)
+        if not 10 <= resize_target < min(cpu, mem):
+            raise SystemExit("need 10 <= RESIZE_TARGET_PERCENT < CPU_PERCENT and MEM_PERCENT")
         return cls(
             nodes=nodes,
             docker_hosts=_pairs("DOCKER_HOSTS", "docker1=192.0.2.21"),
@@ -127,9 +136,14 @@ class Config:
             keep_snapshots=_bool("KEEP_SNAPSHOTS", False),
             snapshot_keep=min(9, max(1, _int("SNAPSHOT_KEEP", 2))),
             exclude=_list("EXCLUDE_GUESTS"),
-            cpu_percent=min(100, max(1, _int("CPU_PERCENT", 80))),
-            mem_percent=min(100, max(1, _int("MEM_PERCENT", 80))),
+            cpu_percent=cpu,
+            mem_percent=mem,
             sustain_minutes=max(1, _int("SUSTAIN_MINUTES", 15)),
+            resize=_bool("RESIZE", True),
+            resize_target_percent=resize_target,
+            resize_max_cores=max(1, _int("RESIZE_MAX_CORES", 8)),
+            resize_max_mem_gb=max(1, _int("RESIZE_MAX_MEM_GB", 32)),
+            node_mem_max_percent=min(99, max(50, _int("NODE_MEM_MAX_PERCENT", 90))),
             monitor_seconds=max(15, _int("MONITOR_SECONDS", 60)),
             disk_percent=threshold,
             disk_target_percent=target,
