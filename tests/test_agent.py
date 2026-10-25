@@ -615,3 +615,17 @@ def test_discord_posts_are_sent_under_the_agents_own_name(monkeypatch):
     assert notice.Outbox([url]).send(notice.Message("hi"))
     notice.Outbox([url], username="Someone else").send(notice.Message("hi"))
     assert [p["username"] for p in posted] == ["proxmox-janitor", "Someone else"]
+
+
+def test_kuma_add_leaves_out_fields_an_older_server_lacks():
+    from proxmox_janitor.kuma import KumaClient
+
+    k = KumaClient("http://kuma.invalid", "u", "p")
+    sent = []
+    k._call = lambda event, monitor: sent.append(monitor) or {"monitorID": 7}
+    k.monitors = {"1": {"name": "x", "type": "port", "interval": 60, "notificationIDList": {}}}  # a 1.x server
+    assert k.add_monitor({"name": "a", "type": "docker", "interval": 60, "conditions": [], "rabbitmqNodes": []}) == 7
+    assert sent[-1] == {"name": "a", "type": "docker", "interval": 60}
+    k.monitors = {}  # nothing to judge from: send everything
+    k.add_monitor({"name": "b", "conditions": []})
+    assert sent[-1] == {"name": "b", "conditions": []}

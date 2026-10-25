@@ -92,7 +92,10 @@ class KumaClient:
         return res
 
     def add_monitor(self, monitor: dict) -> int:
-        return self._call("add", monitor)["monitorID"]
+        """Add a monitor, without fields this server's version doesn't have: Uptime Kuma 1.x rejects
+        a monitor with any column it doesn't know (judged from the monitors it already has)."""
+        known = set().union(*(m.keys() for m in self.monitors.values())) if self.monitors else set(monitor)
+        return self._call("add", {k: v for k, v in monitor.items() if k in known})["monitorID"]
 
     def add_notification(self, notification: dict) -> dict:
         return self._call("addNotification", notification, None)
