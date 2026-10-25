@@ -11,7 +11,7 @@ from typing import Any
 
 
 class State:
-    SECTIONS = ("notified", "schedule", "window", "over", "grown", "kuma")
+    SECTIONS = ("notified", "schedule", "window", "over", "grown", "resized", "kuma")
 
     def __init__(self, path: str):
         self.path = path

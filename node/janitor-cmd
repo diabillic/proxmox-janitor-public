@@ -18,6 +18,10 @@ can ask for exactly these things and nothing else. Each prints one JSON object o
   guest-disks VMID                each volume: size, storage, and the filesystems on it with their usage
   guest-grow VMID DISK GB MAXPCT  add GB to a volume and grow the filesystem on it, unless that would
                                   take the volume's storage past MAXPCT percent used
+  guest-resize VMID cores|memory N MAXPCT
+                                  raise a guest's cores, or memory to N MiB, unless that's more cores than
+                                  the node has or would commit over MAXPCT percent of the node's RAM to
+                                  running guests; an LXC takes it live, a VM at its next restart
 """
 
 from __future__ import annotations
@@ -206,11 +210,23 @@ def in_guest(vmid: str, kind: str, script: str, timeout: int) -> str:
     return (data.get("out-data") or "") + (data.get("err-data") or "")
 
 
+def pending(vmid: str, kind: str) -> dict[str, tuple[str, str]]:
+    """Config changes waiting for a restart: key -> (running value, new value)."""
+    rows = pvesh(f"/nodes/{socket.gethostname()}/{kind}/{vmid}/pending")
+    return {r["key"]: (str(r.get("value", "")), str(r["pending"])) for r in rows if "pending" in r}
+
+
 def guest_check(vmid: str) -> dict:
     kind = guest_type(vmid)
     if not guest_running(vmid, kind):
         return {"vmid": vmid, "type": kind, "running": False}
-    return {"vmid": vmid, "type": kind, "running": True, **parse_check(in_guest(vmid, kind, CHECK_SH, 900), kind == "qemu")}
+    facts = parse_check(in_guest(vmid, kind, CHECK_SH, 900), kind == "qemu")
+    waiting = {k: v for k, v in pending(vmid, kind).items() if k in RESIZE_KEYS}
+    if waiting:
+        facts["reasons"].append("CPU/RAM change waits for a restart: " +
+                                ", ".join(f"{k} {old or '?'} -> {new}" for k, (old, new) in waiting.items()))
+        facts["restart_needed"] = True
+    return {"vmid": vmid, "type": kind, "running": True, **facts}
 
 
 def guest_patch(vmid: str) -> dict:
@@ -390,6 +406,54 @@ def guest_grow(vmid: str, disk: str, gb: str, maxpct: str) -> dict:
     return {"vmid": vmid, "disk": disk, "added_gb": int(gb), **guest_disks(vmid)}
 
 
+# --- CPU and RAM ---
+
+RESIZE_KEYS = ("cores", "sockets", "vcpus", "memory")
+
+
+def _memory_mib(text: str) -> int:
+    """`memory: 8192` or `memory: current=8192`."""
+    m = re.search(r"(?:^|current=)(\d+)", text or "")
+    return int(m.group(1)) if m else 512
+
+
+def guest_resize(vmid: str, what: str, value: str, maxpct: str) -> dict:
+    kind = guest_type(vmid)
+    cfg = guest_config(vmid, kind)  # pending values included: never "raise" to below one already waiting
+    host = pvesh(f"/nodes/{socket.gethostname()}/status")
+    new = int(value)
+    if what == "cores":
+        if float(cfg.get("cpulimit") or 0):
+            raise Refused("it has a CPU limit (cpulimit); raise that by hand")
+        if cfg.get("vcpus"):
+            raise Refused("it sets vcpus; raise that by hand")
+        sockets = int(cfg.get("sockets") or 1)
+        cur = int(cfg.get("cores") or (1 if kind == "qemu" else 0)) * sockets
+        if not cur:
+            raise Refused("it has no core limit, so it can already use every core of the node")
+        new = -(-new // sockets) * sockets
+        cpus = int(host["cpuinfo"]["cpus"])
+        if new > cpus:
+            raise Refused(f"{new} cores is more than node {socket.gethostname()} has ({cpus})")
+        args = ["--cores", str(new // sockets)]
+    else:
+        cur = _memory_mib(cfg.get("memory", ""))
+        mine = f"{kind}/{vmid}"
+        committed = sum(r.get("maxmem") or 0 for r in _resources("vm")
+                        if r.get("node") == socket.gethostname() and r.get("status") == "running" and r.get("id") != mine)
+        total = int(host["memory"]["total"])
+        if (committed + new * 1024 ** 2) * 100 / total > int(maxpct):
+            raise Refused(f"running guests would have over {maxpct}% of node {socket.gethostname()}'s RAM")
+        args = ["--memory", str(new)]
+    if new <= cur:
+        raise Refused(f"it already has {cur} {'cores' if what == 'cores' else 'MiB'} (or that much is waiting for a restart)")
+    rc, out = run([tool(kind), "set", vmid, *args], 120)
+    if rc != 0:
+        raise Refused(f"{tool(kind)} set failed: {out.strip()[-300:]}")
+    live = not any(k in RESIZE_KEYS for k in pending(vmid, kind))
+    return {"vmid": vmid, "type": kind, "what": what, "from": cur, "to": new, "live": live}
+
+
 # --- this node ---
 
 def node_reboot_reasons() -> list[str]:
@@ -441,9 +505,27 @@ def node_reboot() -> dict:
     return {"node": socket.gethostname(), "rebooting": True, "in_seconds": 20}
 
 
+def _vm_memory(node: str, vmid) -> dict:
+    """A VM's memory as the guest sees it. Proxmox's own figure counts the guest's page cache as
+    used, so a healthy VM looks nearly full. {} when the guest agent doesn't answer."""
+    rc, out = run(["pvesh", "get", f"/nodes/{node}/qemu/{vmid}/agent/file-read", "--file", "/proc/meminfo",
+                   "--output-format", "json"], 20)
+    if rc != 0:
+        return {}
+    try:
+        info = dict(re.findall(r"^(\w+):\s+(\d+) kB", json.loads(out).get("content", ""), re.M))
+        total, avail = int(info["MemTotal"]) * 1024, int(info["MemAvailable"]) * 1024
+    except (ValueError, KeyError):
+        return {}
+    return {"mem": total - avail, "memtotal": total, "mem_source": "agent"}
+
+
 def inventory() -> dict:
     keep = ("vmid", "name", "node", "type", "status", "tags", "template", "cpu", "maxcpu", "mem", "maxmem", "uptime")
     guests = [{k: r.get(k) for k in keep} for r in _resources("vm")]
+    for g in guests:
+        if g["type"] == "qemu" and g["status"] == "running" and not g.get("template"):
+            g.update(_vm_memory(g["node"], g["vmid"]) or {"mem_source": "host"})
     nodes = [{k: r.get(k) for k in ("node", "status", "cpu", "maxcpu", "mem", "maxmem", "uptime")}
              for r in _resources("node")]
     quorate, offline = quorum()
@@ -473,6 +555,7 @@ COMMANDS = {
     "guest-start": (guest_start, [VMID]),
     "guest-disks": (guest_disks, [VMID]),
     "guest-grow": (guest_grow, [VMID, DISK_KEY, r"[1-9]\d{0,2}", r"[5-9]\d"]),  # 1-999 GB; 50-99 %
+    "guest-resize": (guest_resize, [VMID, r"cores|memory", r"[1-9]\d{0,6}", r"[5-9]\d"]),  # cores or MiB; 50-99 %
 }
 
 

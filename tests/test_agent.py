@@ -11,8 +11,8 @@ import pytest
 from proxmox_janitor.config import Config
 from proxmox_janitor.findings import Finding
 from proxmox_janitor.janitor import Janitor, Target, schedule_due
-from proxmox_janitor.monitor import GIB, Monitor, grow_gb
-from proxmox_janitor.notify import CPU, DISK, PENDING, RESTART, Notifier, is_health
+from proxmox_janitor.monitor import GIB, MIB, Monitor, grow_gb, resize_to
+from proxmox_janitor.notify import CPU, DISK, MEM, PENDING, RESTART, Notifier, is_health
 from proxmox_janitor.pve import Cluster, Remote, RemoteError
 from proxmox_janitor.state import State
 
@@ -112,6 +112,9 @@ class FakeCluster:
             fs = vol["filesystems"][0]
             fs["total"] += int(args[2]) * GIB
             return {"volumes": [vol]}
+        if request == "guest-resize":
+            g = next(g for g in self.guests if str(g["vmid"]) == vmid)
+            return {"to": int(args[2]), "live": g["type"] == "lxc"}  # a VM takes it at its next restart
         return {"ok": True}
 
     def requests(self, vmid):
@@ -295,7 +298,7 @@ def test_bus_marks_changes_destructive(tmp_path):
 def test_cpu_and_memory_alert_only_when_sustained(tmp_path):
     clock = Clock()
     c = FakeCluster(GUESTS, clock)
-    m = Monitor(c, cfg(tmp_path), FakeNotifier(), State(str(tmp_path / "s.json")), clock=clock)
+    m = Monitor(c, cfg(tmp_path, resize=False), FakeNotifier(), State(str(tmp_path / "s.json")), clock=clock)
     inv = c.inventory()
     inv["guests"][0].update(cpu=0.95, mem=1, maxmem=10)
     inv["guests"][1].update(cpu=0.1, mem=9, maxmem=10)
@@ -305,7 +308,7 @@ def test_cpu_and_memory_alert_only_when_sustained(tmp_path):
     clock.sleep(60)
     fs = {f.key: f for f in m.sample(inv)}
     assert set(fs) == {"cpu:guest:101", "mem:guest:102"} and fs["cpu:guest:101"].section == CPU
-    assert "CPU at 95% for 15 min" in fs["cpu:guest:101"].summary
+    assert "CPU at 95% for 15 min (alert above 75%)" in fs["cpu:guest:101"].summary
     inv["guests"][0]["cpu"] = 0.2  # back to normal: the timer resets
     assert set(f.key for f in m.sample(inv)) == {"mem:guest:102"} and "cpu:guest:101" not in m.state["over"]
 
@@ -319,6 +322,96 @@ def test_hosts_are_watched_too(tmp_path):
     m.sample(inv)
     clock.sleep(15 * 60)
     assert [f.key for f in m.sample(inv)] == ["cpu:node:pve1"]
+
+
+def test_resize_amount():
+    assert resize_to("cpu", 2, 1.6, 60, 8) == 3  # 1.6 cores busy / 0.6 -> 3
+    assert resize_to("cpu", 1, 1.0, 60, 8) == 2
+    assert resize_to("cpu", 4, 4.0, 60, 8) == 7  # 4 / 0.6 = 6.7
+    assert resize_to("cpu", 2, 2.0, 60, 3) == 3  # RESIZE_MAX_CORES
+    assert resize_to("mem", 8192, 7 * GIB, 60, 32768) == 12288  # 7 GB / 0.6 = 11.7 -> next 512 MiB
+    assert resize_to("mem", 1024, 1000 * MIB, 60, 32768) == 2048  # 1000/0.6 = 1667 -> next 512 MiB
+    assert resize_to("mem", 1024, 800 * MIB, 60, 32768) == 1536  # at least one 512 MiB step
+
+
+def test_busy_container_gets_more_cores_live(tmp_path):
+    clock = Clock()
+    c = FakeCluster(GUESTS, clock)
+    n = FakeNotifier()
+    m = Monitor(c, cfg(tmp_path), n, State(str(tmp_path / "s.json")), clock=clock)
+    inv = c.inventory()
+    inv["guests"][0].update(cpu=0.9, maxcpu=2, mem=1, maxmem=10)  # container 101 on pve2
+    m.sample(inv)
+    clock.sleep(15 * 60)
+    assert m.sample(inv) == []  # raised, not alerted
+    assert ("pve2", "guest-resize", "101", "cores", "3", "90") in c.calls
+    assert n.reports[-1][0] == "CPU raised" and "raised from 2 cores to 3 cores. It took effect right away." in \
+        n.reports[-1][1][0]
+    assert "cpu:guest:101" not in m.state["over"]  # measured again from the new size
+    clock.sleep(15 * 60)  # still busy within the hour: reported, not raised again
+    m.sample(inv)
+    clock.sleep(15 * 60)
+    fs = {f.key: f for f in m.sample(inv)}
+    assert "less than an hour ago" in fs["cpu:guest:101"].summary
+    assert sum(1 for x in c.calls if x[1] == "guest-resize") == 1
+
+
+def test_vm_memory_comes_from_its_guest_agent_and_waits_for_a_restart(tmp_path):
+    clock = Clock()
+    c = FakeCluster(GUESTS, clock)
+    n = FakeNotifier()
+    m = Monitor(c, cfg(tmp_path), n, State(str(tmp_path / "s.json")), clock=clock)
+    inv = c.inventory()
+    vm = inv["guests"][2]  # the VM on pve1
+    vm.update(cpu=0.1, maxcpu=4, mem=int(7.9 * GIB), maxmem=8 * GIB, mem_source="host")  # mostly page cache
+    m.sample(inv)
+    clock.sleep(30 * 60)
+    assert m.sample(inv) == [] and not any(x[1] == "guest-resize" for x in c.calls)
+    assert m.latest["guest:200"]["mem"] is None
+    vm.update(mem=7 * GIB, memtotal=int(7.7 * GIB), mem_source="agent")  # 91% as the guest sees it
+    m.sample(inv)
+    clock.sleep(15 * 60)
+    assert m.sample(inv) == []
+    assert ("pve1", "guest-resize", "200", "memory", "12288", "90") in c.calls
+    assert "raised from 8 GB to 12 GB. A VM takes it at its next restart" in n.reports[-1][1][0]
+    clock.sleep(2 * 3600)  # past the cooldown, still not restarted: waits instead of raising again
+    m.sample(inv)
+    clock.sleep(15 * 60)
+    fs = {f.key: f for f in m.sample(inv)}
+    assert fs["mem:guest:200"].section == MEM and "already raised to 12 GB" in fs["mem:guest:200"].summary
+    assert sum(1 for x in c.calls if x[1] == "guest-resize") == 1
+
+
+def test_resize_refused_by_the_node_is_reported_and_not_retried_for_an_hour(tmp_path):
+    clock = Clock()
+    c = FakeCluster(GUESTS, clock, fail={("guest-resize", "102"): "running guests would have over 90% of node pve1's RAM"})
+    m = Monitor(c, cfg(tmp_path), FakeNotifier(), State(str(tmp_path / "s.json")), clock=clock)
+    inv = c.inventory()
+    inv["guests"][1].update(cpu=0.1, maxcpu=2, mem=900 * MIB, maxmem=1024 * MIB)
+    m.sample(inv)
+    clock.sleep(15 * 60)
+    fs = {f.key: f for f in m.sample(inv)}
+    assert "wasn't raised: pve1: running guests would have over 90%" in fs["mem:guest:102"].summary
+    clock.sleep(60)
+    assert "mem:guest:102" in {f.key for f in m.sample(inv)}
+    assert sum(1 for x in c.calls if x[1] == "guest-resize") == 1
+
+
+def test_resize_waits_for_a_busy_window(tmp_path):
+    import threading
+    clock = Clock()
+    c = FakeCluster(GUESTS, clock)
+    ops = threading.Lock()
+    m = Monitor(c, cfg(tmp_path), FakeNotifier(), State(str(tmp_path / "s.json")), ops=ops, clock=clock)
+    inv = c.inventory()
+    inv["guests"][0].update(cpu=0.9, maxcpu=2, mem=1, maxmem=10)
+    m.sample(inv)
+    clock.sleep(15 * 60)
+    with ops:
+        assert m.sample(inv) == []
+    assert not any(x[1] == "guest-resize" for x in c.calls)
+    m.sample(inv)
+    assert any(x[1] == "guest-resize" for x in c.calls)
 
 
 def disks(used_gb, total_gb, growable=True, storage_used=100, storage_total=1000):
@@ -448,8 +541,14 @@ def test_config(monkeypatch):
     monkeypatch.setenv("DOCKER_HOSTS", "docker1=192.0.2.21")
     c = Config.from_env()
     assert c.nodes == {"pve1": "192.0.2.11", "pve2": "192.0.2.12"} and c.docker_hosts == {"docker1": "192.0.2.21"}
-    assert (c.cpu_percent, c.mem_percent, c.sustain_minutes, c.disk_percent, c.disk_target_percent) == (80, 80, 15, 85, 70)
+    assert (c.cpu_percent, c.mem_percent, c.sustain_minutes, c.disk_percent, c.disk_target_percent) == (75, 75, 15, 85, 70)
+    assert (c.resize, c.resize_target_percent, c.resize_max_cores, c.resize_max_mem_gb, c.node_mem_max_percent) == \
+        (True, 60, 8, 32, 90)
     assert (c.window_day, c.window_time, c.reboot_guests, c.reboot_nodes, c.redeploy) == ("sun", "03:00", True, True, True)
+    monkeypatch.setenv("RESIZE_TARGET_PERCENT", "75")  # must be below the thresholds
+    with pytest.raises(SystemExit):
+        Config.from_env()
+    monkeypatch.delenv("RESIZE_TARGET_PERCENT")
     monkeypatch.setenv("DISK_TARGET_PERCENT", "90")
     with pytest.raises(SystemExit):
         Config.from_env()
@@ -486,7 +585,8 @@ def test_node_cmd_refuses_anything_unexpected():
     for bad in ["", "reboot", "node-reboot now", "guest-check 102; rm -rf /", "guest-check abc", "guest-snapshot 102 0",
                 "guest-delsnapshot 102 important-snap", "guest-grow 102 rootfs 0 90", "guest-grow 102 rootfs 1000 90",
                 "guest-grow 102 rootfs 5 100", "guest-grow 102 rootfs 5 40", "guest-grow 102 efidisk0 5 90",
-                "guest-grow 102 rootfs 5", "inventory now"]:
+                "guest-grow 102 rootfs 5", "inventory now", "guest-resize 102 swap 1024 90",
+                "guest-resize 102 cores 0 90", "guest-resize 102 memory 1024 100", "guest-resize 102 cores 4"]:
         with pytest.raises(m.Refused):
             m.dispatch(bad)
     called = []
@@ -495,7 +595,50 @@ def test_node_cmd_refuses_anything_unexpected():
     assert called == [("102", "mp0", "12", "90")]
 
 
-def test_node_cmd_wont_reboot_a_node_without_full_quorum(monkeypatch):
+def node_resize_env(monkeypatch, m, config, guests, pend=None):
+    ran = []
+    monkeypatch.setattr(m, "guest_type", lambda vmid: "qemu")
+    monkeypatch.setattr(m, "guest_config", lambda vmid, kind: dict(config))
+    monkeypatch.setattr(m.socket, "gethostname", lambda: "pve1")
+    monkeypatch.setattr(m, "pvesh", lambda path, timeout=60: {"cpuinfo": {"cpus": 8}, "memory": {"total": 16 * GIB}})
+    monkeypatch.setattr(m, "_resources", lambda kind: guests)
+    monkeypatch.setattr(m, "pending", lambda vmid, kind: pend or {})
+    monkeypatch.setattr(m, "run", lambda cmd, timeout=600: ran.append(cmd) or (0, ""))
+    return ran
+
+
+def test_node_cmd_resize_checks_the_node_first(monkeypatch):
+    m = node_cmd()
+    others = [{"id": "lxc/101", "node": "pve1", "status": "running", "maxmem": 10 * GIB},
+              {"id": "qemu/200", "node": "pve1", "status": "running", "maxmem": 4 * GIB},
+              {"id": "lxc/300", "node": "pve2", "status": "running", "maxmem": 64 * GIB}]
+    ran = node_resize_env(monkeypatch, m, {"cores": "2", "memory": "current=4096"}, others,
+                          pend={"memory": ("4096", "4608")})
+    with pytest.raises(m.Refused, match="over 90% of node pve1's RAM"):
+        m.guest_resize("200", "memory", "4608", "90")  # 10 + 4.5 of 16 GB = 91% (pve2's guests don't count)
+    assert m.guest_resize("200", "memory", "4608", "95") == {"vmid": "200", "type": "qemu", "what": "memory",
+                                                          "from": 4096, "to": 4608, "live": False}
+    assert ran[-1] == ["qm", "set", "200", "--memory", "4608"]
+    with pytest.raises(m.Refused, match="already has 4096 MiB"):
+        m.guest_resize("200", "memory", "4096", "95")
+    with pytest.raises(m.Refused, match="more than node pve1 has"):
+        m.guest_resize("200", "cores", "9", "90")
+    m.guest_resize("200", "cores", "4", "90")
+    assert ran[-1] == ["qm", "set", "200", "--cores", "4"] and len(ran) == 2
+    node_resize_env(monkeypatch, m, {"cores": "2", "cpulimit": "1.5"}, others)
+    with pytest.raises(m.Refused, match="cpulimit"):
+        m.guest_resize("200", "cores", "4", "90")
+
+
+def test_node_cmd_check_asks_for_a_restart_when_a_resize_is_waiting(monkeypatch):
+    m = node_cmd()
+    monkeypatch.setattr(m, "guest_type", lambda vmid: "qemu")
+    monkeypatch.setattr(m, "guest_running", lambda vmid, kind: True)
+    monkeypatch.setattr(m, "in_guest", lambda vmid, kind, script, timeout: "@@UPDATE_RC 0\n@@KERNEL 6.1 6.1")
+    monkeypatch.setattr(m, "pending", lambda vmid, kind: {"memory": ("8192", "12288"), "name": ("a", "b")})
+    facts = m.guest_check("200")
+    assert facts["restart_needed"] and facts["reasons"] == ["CPU/RAM change waits for a restart: memory 8192 -> 12288"]
+
     m = node_cmd()
     monkeypatch.setattr(m, "quorum", lambda: (True, ["pve2"]))
     ran = []

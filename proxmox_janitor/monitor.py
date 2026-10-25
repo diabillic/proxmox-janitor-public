@@ -1,8 +1,12 @@
-"""Health: sustained CPU/RAM alerts for every guest and node, and disks grown before they fill.
+"""Health: guests given more CPU/RAM when they stay busy, nodes alerted, disks grown before they fill.
 
 CPU and RAM come from the cluster's own resource view (one call for everything) every
-MONITOR_SECONDS. A value over its threshold starts a timer; once it has stayed over for
-SUSTAIN_MINUTES it's reported, and reported as cleared when it drops back.
+MONITOR_SECONDS; a VM's RAM comes from its guest agent instead, because Proxmox counts the guest's
+page cache as used. A value over its threshold starts a timer. Once it has stayed over for
+SUSTAIN_MINUTES, a guest gets enough cores or memory to bring that load back to about
+RESIZE_TARGET_PERCENT (at most double, RESIZE_MAX_CORES / RESIZE_MAX_MEM_GB, what its node has).
+An LXC takes it live; a VM at its next restart, which the maintenance window does. A node, or a
+guest that can't be raised, is reported instead, and reported as cleared when it drops back.
 
 Every DISK_MINUTES each running guest's volumes are read (LXC: df inside, VM: guest agent). When a
 filesystem passes DISK_PERCENT its volume grows by enough to bring it back to about
@@ -25,9 +29,11 @@ from .state import State
 
 log = logging.getLogger(__name__)
 
-GIB = 1024 ** 3
+GIB, MIB = 1024 ** 3, 1024 ** 2
 KIND_LABEL = {"lxc": "CT", "qemu": "VM"}
 GROW_COOLDOWN = 3600  # don't grow the same volume again within this
+RESIZE_COOLDOWN = 3600  # nor raise the same guest's CPU or RAM again
+MEM_STEP = 512  # MiB
 PASS_GRACE = 15 * 60  # longest a pass (every node and guest, plus any disk growth) should take
 
 
@@ -35,6 +41,20 @@ def grow_gb(used: int, total: int, target_percent: int, min_gb: int, max_gb: int
     """GiB to add so `used` is about target_percent of the grown filesystem."""
     need = used / (target_percent / 100) - total
     return min(max_gb, max(min_gb, math.ceil(need / GIB)))
+
+
+def resize_to(metric: str, cur: int, used: float, target_percent: int, max_value: int) -> int:
+    """New cores (or MiB) so `used` cores (or bytes) is about target_percent of it: at least one
+    step up, at most double, at most max_value."""
+    if metric == "cpu":
+        need, step = math.ceil(used / (target_percent / 100)), 1
+    else:
+        need, step = math.ceil(used / (target_percent / 100) / MIB / MEM_STEP) * MEM_STEP, MEM_STEP
+    return min(max(cur + step, need), cur * 2, max_value)
+
+
+def _amount(metric: str, n: int) -> str:
+    return f"{n} cores" if metric == "cpu" else f"{n / 1024:g} GB"
 
 
 def _label(kind: str, ident: str, name: str, node: str) -> tuple[str, str]:
@@ -68,27 +88,80 @@ class Monitor:
                  and not self._excluded(str(g["vmid"]), g.get("name") or "")]
         for kind, ident, name, node, r in rows:
             plain, md = _label(kind, ident, name, node)
+            total = r.get("memtotal") or r.get("maxmem")
             values = {"cpu": (r.get("cpu") or 0) * 100,
-                      "mem": (r.get("mem") or 0) * 100 / r["maxmem"] if r.get("maxmem") else 0}
-            latest[f"{'node' if kind == 'node' else 'guest'}:{ident}"] = {"name": name, "kind": kind, "node": node,
-                                                                          **{k: round(v, 1) for k, v in values.items()}}
+                      # None: a VM whose guest agent didn't answer (the host's figure includes its page cache)
+                      "mem": None if r.get("mem_source") == "host" else (r.get("mem") or 0) * 100 / total if total else 0}
+            latest[f"{'node' if kind == 'node' else 'guest'}:{ident}"] = {
+                "name": name, "kind": kind, "node": node,
+                **{k: None if v is None else round(v, 1) for k, v in values.items()}}
             for metric, limit, section, what in (("cpu", self.cfg.cpu_percent, CPU, "CPU"),
                                                  ("mem", self.cfg.mem_percent, MEM, "memory")):
                 key = f"{metric}:{'node' if kind == 'node' else 'guest'}:{ident}"
                 seen.add(key)
-                if values[metric] < limit:
+                value = values[metric]
+                if value is None or value < limit:
                     over.pop(key, None)
                     continue
                 since = over.setdefault(key, now)
                 minutes = int((now - since) // 60)
-                if minutes >= self.cfg.sustain_minutes:
-                    findings.append(Finding(
-                        key, f"{plain}: {what} at {values[metric]:.0f}% for {minutes} min (alert above {limit}%).",
-                        section=section, line=f"{md} — {values[metric]:.0f}% for {minutes} min"))
+                if minutes < self.cfg.sustain_minutes:
+                    continue
+                if kind != "node" and self.cfg.resize:
+                    f = self._resize(key, metric, what, section, r, value, minutes, plain, md)
+                else:
+                    f = Finding(key, f"{plain}: {what} at {value:.0f}% for {minutes} min (alert above {limit}%).",
+                                section=section, line=f"{md} — {value:.0f}% for {minutes} min")
+                if f:
+                    findings.append(f)
         for key in [k for k in over if k not in seen]:  # stopped, removed or excluded since
             del over[key]
         self.latest = latest
         return findings
+
+    def _resize(self, key: str, metric: str, what: str, section: str, r: dict, value: float, minutes: int,
+                plain: str, md: str) -> Finding | None:
+        """Give a guest more cores or memory. None when done (or put off while the window is busy)."""
+        def problem(why: str) -> Finding:
+            return Finding(key, f"{plain}: {what} at {value:.0f}% for {minutes} min and wasn't raised: {why}",
+                           section=section, line=f"{md} — {value:.0f}% for {minutes} min, not raised: {why}")
+
+        if metric == "cpu":
+            cur, used, cap = int(r.get("maxcpu") or 1), (r.get("maxcpu") or 1) * value / 100, self.cfg.resize_max_cores
+        else:
+            cur, used, cap = int(r.get("maxmem") or 0) // MIB, r.get("mem") or 0, self.cfg.resize_max_mem_gb * 1024
+        resized, now = self.state["resized"], self.clock()
+        last = resized.get(key)
+        if last and not last.get("error") and not last.get("live") and cur < last["to"]:
+            return problem(f"already raised to {_amount(metric, last['to'])}, which a VM takes at its next restart "
+                           "(the maintenance window does that)")
+        if last and now - last["at"] < RESIZE_COOLDOWN:
+            return problem(last.get("error") or "it was raised less than an hour ago and is still this busy")
+        new = resize_to(metric, cur, used, self.cfg.resize_target_percent, cap)
+        if new <= cur:
+            return problem(f"it already has the most the janitor gives a guest ({_amount(metric, cap)})")
+        if self.ops is not None and not self.ops.acquire(blocking=False):
+            return None  # the maintenance window (or a request) is busy; try on the next pass
+        try:
+            res = self.cluster.call(r.get("node", "?"), "guest-resize", str(r["vmid"]),
+                                    "cores" if metric == "cpu" else "memory", str(new),
+                                    str(self.cfg.node_mem_max_percent), timeout=180)
+        except RemoteError as exc:
+            resized[key] = {"at": now, "error": str(exc)}
+            return problem(str(exc))
+        finally:
+            if self.ops is not None:
+                self.ops.release()
+        live = bool(res.get("live"))
+        resized[key] = {"at": now, "to": int(res.get("to") or new), "live": live}
+        self.state["over"].pop(key, None)  # measure again from the new size
+        when = "It took effect right away." if live else \
+            "A VM takes it at its next restart; the maintenance window restarts it."
+        self.notifier.report(f"{what[0].upper()}{what[1:]} raised",
+                             [f"⬆️ {md}: {what} was at {value:.0f}% for {minutes} min; raised from "
+                              f"{_amount(metric, cur)} to {_amount(metric, resized[key]['to'])}. {when}"])
+        log.info("Raised %s %s %s -> %s (live=%s)", plain, metric, cur, resized[key]["to"], live)
+        return None
 
     # --- disks ---
 
