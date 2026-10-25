@@ -54,7 +54,9 @@ and the entries once, from inside the janitor container, with the webhook on std
 echo "$DISCORD_WEBHOOK" | docker exec -i proxmox-janitor python -m proxmox_janitor.kuma setup   --docker-host docker1=tcp://docker-socket-proxy:2375 --docker-host docker2=tcp://192.0.2.22:2376
 ```
 
-The account must not use 2FA; the janitor logs in with a username and password.
+The account must not use 2FA; the janitor logs in with a username and password. Uptime Kuma 1.23 and 2.x
+both work: fields an older server doesn't have are left out of the monitors it adds. Uptime Kuma can run
+anywhere that reaches the proxies, including outside the Docker hosts it watches.
 
 The janitor's own container has a Docker health check (`python -m proxmox_janitor.health`), so its monitor
 reports more than "running". It turns `unhealthy` when one of its loops stops coming round: the scheduler
