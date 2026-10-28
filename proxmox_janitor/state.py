@@ -6,7 +6,6 @@ import json
 import os
 import tempfile
 import threading
-import time
 from typing import Any
 
 
@@ -37,16 +36,3 @@ class State:
 
     def __getitem__(self, section: str) -> dict[str, Any]:
         return self.data[section]
-
-    def within(self, section: str, key: str, hours: float, now: float | None = None) -> bool:
-        ts = self.data[section].get(key)
-        return ts is not None and (now or time.time()) - ts < hours * 3600
-
-    def mark(self, section: str, key: str, now: float | None = None) -> None:
-        self.data[section][key] = now or time.time()
-
-    def expire(self, section: str, hours: float, now: float | None = None) -> None:
-        cutoff = (now or time.time()) - hours * 3600
-        sec = self.data[section]
-        for k in [k for k, ts in sec.items() if isinstance(ts, (int, float)) and ts < cutoff]:
-            del sec[k]

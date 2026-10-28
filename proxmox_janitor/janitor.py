@@ -23,13 +23,12 @@ from datetime import datetime, timedelta
 from . import health
 from .config import DAYS, Config
 from .findings import Finding
-from .notify import PENDING, PROBLEMS, RESTART, SKIPPED, Notifier, is_health
+from .notify import PENDING, PROBLEMS, RESTART, SKIPPED, Notifier, is_health, labels
 from .pve import Cluster, Remote, RemoteError
 from .state import State
 
 log = logging.getLogger(__name__)
 
-KIND_LABEL = {"lxc": "CT", "qemu": "VM"}
 WAIT_GUEST = 600  # seconds for a restarted guest to run again
 WAIT_NODE = 1800  # for a rebooted node to rejoin
 WAIT_REDEPLOY = 5400  # for every agent on a Docker host to be rebuilt
@@ -55,16 +54,12 @@ class Target:
 
     @property
     def label(self) -> str:
-        if self.kind == "node":
-            return f"node {self.name}"
-        return f"{self.name} ({KIND_LABEL.get(self.kind, self.kind)} {self.ident} on {self.node})"
+        return labels(self.kind, self.ident, self.name, self.node)[0]
 
     @property
     def md(self) -> str:
         """Markdown label for notifications: the name in bold, then where it lives."""
-        if self.kind == "node":
-            return f"**{self.name}** · host"
-        return f"**{self.name}** · {KIND_LABEL.get(self.kind, self.kind)} {self.ident} on {self.node}"
+        return labels(self.kind, self.ident, self.name, self.node)[1]
 
     @property
     def priority(self) -> str:
@@ -116,9 +111,6 @@ class Janitor:
 
     # --- checking ---
 
-    def _excluded(self, vmid: str, name: str) -> bool:
-        return vmid in self.cfg.exclude or name in self.cfg.exclude
-
     @staticmethod
     def _fill(t: Target, facts: dict) -> None:
         t.supported = facts.get("supported", True)
@@ -133,7 +125,7 @@ class Janitor:
         tags = [x for x in str(g.get("tags") or "").replace(",", ";").split(";") if x]
         t = Target(f"guest:{vmid}", g.get("type", "lxc"), vmid, name, g.get("node", "?"), tags,
                    status=g.get("status") or "unknown")
-        if self._excluded(vmid, name):
+        if self.cfg.excluded(vmid, name):
             t.status = "excluded"
         elif t.node not in self.cfg.nodes:
             t.error = f"its node {t.node} isn't in PVE_NODES"

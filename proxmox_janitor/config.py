@@ -104,6 +104,9 @@ class Config:
     approval_urls: list[str] = field(default_factory=list)
     approval_mode: str = "code"  # "code" (agent-enforced) or "client" (assistant asks; audited)
 
+    def excluded(self, vmid: str, name: str) -> bool:
+        return vmid in self.exclude or name in self.exclude
+
     @classmethod
     def from_env(cls) -> "Config":
         nodes = _pairs("PVE_NODES", "pve1=192.0.2.11")

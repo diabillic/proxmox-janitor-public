@@ -28,10 +28,19 @@ ORDER = [PROBLEMS, CPU, MEM, DISK, RESTART, PENDING, SKIPPED]
 NOTES = {RESTART: "Done in the next maintenance window, or ask Hermes to patch it sooner."}
 
 HEALTH_PREFIXES = ("cpu:", "mem:", "disk:")
+KIND_LABEL = {"lxc": "CT", "qemu": "VM"}
 
 
 def is_health(key: str) -> bool:
     return key.startswith(HEALTH_PREFIXES)
+
+
+def labels(kind: str, ident: str, name: str, node: str) -> tuple[str, str]:
+    """A node or guest named in plain text, and in markdown (name in bold, then where it lives)."""
+    if kind == "node":
+        return f"node {name}", f"**{name}** · host"
+    where = f"{KIND_LABEL.get(kind, kind)} {ident} on {node}"
+    return f"{name} ({where})", f"**{name}** · {where}"
 
 
 class Notifier:
@@ -44,12 +53,14 @@ class Notifier:
         self.footer = footer
 
     def send(self, findings: list[Finding], complete: bool = True, in_scope: Callable[[str], bool] | None = None,
-             owns: Callable[[str], bool] | None = None) -> None:
+             owns: Callable[[str], bool] | None = None, waiting: set[str] = frozenset()) -> None:
         """One digest: new items, reminders every renotify_hours, and items that cleared.
 
         owns(key) picks the findings this digest is responsible for (health and patch digests
         share one dedupe store). complete=False (some targets couldn't be checked) suppresses
         "cleared". in_scope(key) false means the target isn't checked any more: forgotten silently.
+        waiting holds keys still unresolved but put off this time (e.g. until the window is done):
+        neither new nor cleared.
         """
         with self.state.lock:
             notified = self.state["notified"]
@@ -57,7 +68,7 @@ class Notifier:
             for k in [k for k in notified if in_scope and not in_scope(k)]:
                 del notified[k]
             mine = {k: v for k, v in notified.items() if owns is None or owns(k)}
-            current = {f.key for f in findings} if complete else set(mine) | {f.key for f in findings}
+            current = ({f.key for f in findings} if complete else set(mine) | {f.key for f in findings}) | waiting
 
             due = []
             for f in findings:

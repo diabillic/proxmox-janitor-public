@@ -12,9 +12,6 @@ class RemoteError(Exception):
     pass
 
 
-NodeError = RemoteError  # the node-facing name used across the janitor
-
-
 class Remote:
     def __init__(self, hosts: dict[str, str], ssh_key: str, known_hosts: str, user: str = "root",
                  runner: Callable = subprocess.run):

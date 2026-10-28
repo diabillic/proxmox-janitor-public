@@ -138,7 +138,7 @@ class FakeNotifier:
     def __init__(self):
         self.sent, self.reports = [], []
 
-    def send(self, findings, complete=True, in_scope=None, owns=None):
+    def send(self, findings, complete=True, in_scope=None, owns=None, waiting=frozenset()):
         self.sent.append((findings, complete))
 
     def report(self, title, lines):
@@ -463,6 +463,32 @@ def test_disk_grow_waits_for_a_busy_window(tmp_path):
     with ops:
         assert m.check_disks(c.inventory()) == []
     assert not any(x[1] == "guest-grow" for x in c.calls)
+
+
+def test_waiting_for_a_busy_window_doesnt_clear_an_alert(tmp_path):
+    import threading
+    clock = Clock()
+    c = FakeCluster(GUESTS, clock, fail={("guest-resize", "101"): "node is full", ("guest-grow", "101"): "no space"})
+    c.guests[0].update(cpu=0.9, maxcpu=2, mem=1, maxmem=10)
+    c.disks["101"] = disks(36, 40)
+    n = Notifier([], 24, State(str(tmp_path / "s.json")))
+    sent = []
+    n._deliver = lambda msg, due: sent.append(msg) or True
+    ops = threading.Lock()
+    m = Monitor(c, cfg(tmp_path), n, n.state, ops=ops, clock=clock)
+    m.run_once()  # disk grow fails: alerted
+    clock.sleep(15 * 60)
+    m.run_once()  # CPU sustained, resize fails: alerted
+    assert len(sent) == 2
+    c.fail.clear()
+    clock.sleep(61 * 60)  # both may be retried now, but the window holds the lock
+    with ops:
+        m.run_once()
+    assert len(sent) == 2  # still a problem, so nothing is "cleared"
+    m.run_once()  # window done: CPU raised, so its alert clears
+    assert any(x[1] == "guest-resize" for x in c.calls[-30:])
+    assert sent[-1].sections[0].heading == "✅ Cleared" and len(sent[-1].sections[0].lines) == 1
+    assert "CPU at 90%" in sent[-1].sections[0].lines[0]  # the disk is still waiting for its next check
 
 
 def test_health_and_patch_digests_dont_clear_each_other(tmp_path):
