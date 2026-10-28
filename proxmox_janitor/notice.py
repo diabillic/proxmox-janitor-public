@@ -31,7 +31,7 @@ AGENT_NAME = (__package__ or "agent").split(".")[0].replace("_", "-")
 # The sender's avatar: the icon of the service the agent looks after (dashboard-icons, via jsDelivr).
 ICONS = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons@main/png/{}.png"
 SERVICES = {"sonarr": "sonarr", "radarr": "radarr", "unraid": "unraid", "proxmox": "proxmox",
-            "dockerfile": "docker", "crowdsec": "crowdsec"}
+            "dockerfile": "docker", "crowdsec": "crowdsec", "unifi": "unifi"}
 AVATAR = next((ICONS.format(icon) for prefix, icon in SERVICES.items() if AGENT_NAME.startswith(prefix)), "")
 
 
