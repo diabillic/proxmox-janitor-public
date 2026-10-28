@@ -49,8 +49,11 @@ apt-get update -q >/tmp/.janitor-update 2>&1; echo "@@UPDATE_RC $?"
 grep -E '^(E|Err):' /tmp/.janitor-update | head -5 | sed 's/^/@@UPDATE_ERR /'
 apt-get -s -o Debug::NoLocking=1 full-upgrade 2>/dev/null | grep -E '^(Inst|Remv) '
 [ -e /run/reboot-required ] && echo "@@REBOOT_FILE"
+# Named by executable, not comm: comm is often a thread name such as MainThread or (sd-pam)
 for d in /proc/[0-9]*; do
-  grep -E ' \(deleted\)$' "$d/maps" 2>/dev/null | grep -qE '\.so|/usr/(lib|bin|sbin|libexec)/' && echo "@@STALE $(cat "$d/comm" 2>/dev/null)"
+  grep -E ' \(deleted\)$' "$d/maps" 2>/dev/null | grep -qE '\.so|/usr/(lib|bin|sbin|libexec)/' || continue
+  exe=$(readlink "$d/exe" 2>/dev/null); exe=${exe%% (deleted)}
+  echo "@@STALE ${exe##*/}"
 done | sort -u | head -20
 echo "@@KERNEL $(uname -r) $(ls /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | sort -V | tail -1)"
 """

@@ -23,14 +23,13 @@ import time
 from . import health
 from .config import Config
 from .findings import Finding
-from .notify import CPU, DISK, MEM, Notifier, is_health
+from .notify import CPU, DISK, MEM, Notifier, is_health, labels
 from .pve import Cluster, RemoteError
 from .state import State
 
 log = logging.getLogger(__name__)
 
 GIB, MIB = 1024 ** 3, 1024 ** 2
-KIND_LABEL = {"lxc": "CT", "qemu": "VM"}
 GROW_COOLDOWN = 3600  # don't grow the same volume again within this
 RESIZE_COOLDOWN = 3600  # nor raise the same guest's CPU or RAM again
 MEM_STEP = 512  # MiB
@@ -57,13 +56,6 @@ def _amount(metric: str, n: int) -> str:
     return f"{n} cores" if metric == "cpu" else f"{n / 1024:g} GB"
 
 
-def _label(kind: str, ident: str, name: str, node: str) -> tuple[str, str]:
-    if kind == "node":
-        return f"node {name}", f"**{name}** · host"
-    return (f"{name} ({KIND_LABEL.get(kind, kind)} {ident} on {node})",
-            f"**{name}** · {KIND_LABEL.get(kind, kind)} {ident} on {node}")
-
-
 class Monitor:
     def __init__(self, cluster: Cluster, cfg: Config, notifier: Notifier, state: State, ops=None, clock=time.time,
                  grow: bool = True):
@@ -72,22 +64,23 @@ class Monitor:
         self.disk_findings: list[Finding] = []
         self.last_disk_at = 0.0
         self.latest: dict[str, dict] = {}  # key -> {label, cpu, mem} from the last sample, for the bus
-
-    def _excluded(self, vmid: str, name: str) -> bool:
-        return vmid in self.cfg.exclude or name in self.cfg.exclude
+        # Keys of a resize or grow put off while the window (or a request) is busy: still unresolved
+        self.waiting: set[str] = set()
+        self.disks_waiting: set[str] = set()
 
     # --- CPU and RAM ---
 
     def sample(self, inv: dict) -> list[Finding]:
         now, over = self.clock(), self.state["over"]
         seen, findings, latest = set(), [], {}
+        self.waiting = set()
         rows = [("node", n["node"], n["node"], n["node"], n) for n in inv.get("nodes") or [] if n.get("status") == "online"]
         rows += [(g.get("type", "lxc"), str(g["vmid"]), g.get("name") or str(g["vmid"]), g.get("node", "?"), g)
                  for g in inv.get("guests") or []
                  if g.get("status") == "running" and not g.get("template")
-                 and not self._excluded(str(g["vmid"]), g.get("name") or "")]
+                 and not self.cfg.excluded(str(g["vmid"]), g.get("name") or "")]
         for kind, ident, name, node, r in rows:
-            plain, md = _label(kind, ident, name, node)
+            plain, md = labels(kind, ident, name, node)
             total = r.get("memtotal") or r.get("maxmem")
             values = {"cpu": (r.get("cpu") or 0) * 100,
                       # None: a VM whose guest agent didn't answer (the host's figure includes its page cache)
@@ -141,7 +134,8 @@ class Monitor:
         if new <= cur:
             return problem(f"it already has the most the janitor gives a guest ({_amount(metric, cap)})")
         if self.ops is not None and not self.ops.acquire(blocking=False):
-            return None  # the maintenance window (or a request) is busy; try on the next pass
+            self.waiting.add(key)  # the maintenance window (or a request) is busy; try on the next pass
+            return None
         try:
             res = self.cluster.call(r.get("node", "?"), "guest-resize", str(r["vmid"]),
                                     "cores" if metric == "cpu" else "memory", str(new),
@@ -167,11 +161,12 @@ class Monitor:
 
     def check_disks(self, inv: dict) -> list[Finding]:
         findings = []
+        self.disks_waiting = set()
         for g in inv.get("guests") or []:
             vmid, name, node = str(g["vmid"]), g.get("name") or str(g["vmid"]), g.get("node", "?")
-            if g.get("status") != "running" or g.get("template") or self._excluded(vmid, name) or node not in self.cfg.nodes:
+            if g.get("status") != "running" or g.get("template") or self.cfg.excluded(vmid, name) or node not in self.cfg.nodes:
                 continue
-            plain, md = _label(g.get("type", "lxc"), vmid, name, node)
+            plain, md = labels(g.get("type", "lxc"), vmid, name, node)
             try:
                 disks = self.cluster.call(node, "guest-disks", vmid, timeout=180)
             except RemoteError as exc:
@@ -213,7 +208,8 @@ class Monitor:
         if self.clock() - grown.get(f"{vmid}:{vol['disk']}", 0) < GROW_COOLDOWN:
             return problem("it was grown less than an hour ago and is still this full")
         if self.ops is not None and not self.ops.acquire(blocking=False):
-            return None  # the maintenance window (or a request) is busy; try on the next pass
+            self.disks_waiting.add(key)  # the maintenance window (or a request) is busy; try on the next pass
+            return None
         try:
             res = self.cluster.call(node, "guest-grow", vmid, vol["disk"], str(gb), str(self.cfg.storage_max_percent),
                                     timeout=1200)
@@ -243,7 +239,7 @@ class Monitor:
         if self.clock() - self.last_disk_at >= self.cfg.disk_minutes * 60:
             self.last_disk_at = self.clock()
             self.disk_findings = self.check_disks(inv)
-        self.notifier.send(findings + self.disk_findings, owns=is_health)
+        self.notifier.send(findings + self.disk_findings, owns=is_health, waiting=self.waiting | self.disks_waiting)
         self.state.save()
 
     def loop(self) -> None:
