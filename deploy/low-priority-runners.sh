@@ -38,12 +38,13 @@ for host in $NODES; do
   name="$PREFIX-$node"
   echo "==> $node: runner LXC $name"
   ssh "$host" "mkdir -p $REMOTE"
-  scp -q "$HERE/proxmox/create-lxc.sh" "$HERE/lxc/bootstrap-runner.sh" "$host:$REMOTE/"
+  scp -q "$HERE/proxmox/create-lxc.sh" "$HERE/lxc/bootstrap-runner.sh" "$HERE/lxc/runner-cleanup.sh" "$host:$REMOTE/"
   scp -q "$ADMIN_PUBKEY" "$host:$REMOTE/admin.pub"
   out=$(ssh "$host" "$passthru MEMORY=2048 CORES=2 DISK=12 bash $REMOTE/create-lxc.sh auto $name $REMOTE/admin.pub '$TAGS'")
   echo "$out"
   ct=$(kv CTID "$out"); ip=$(kv IP "$out")
   ssh "$host" "pct push $ct $REMOTE/bootstrap-runner.sh /root/bootstrap-runner.sh"
+  ssh "$host" "pct push $ct $REMOTE/runner-cleanup.sh /root/runner-cleanup.sh && pct exec $ct -- bash /root/runner-cleanup.sh install"
 
   for repo in $REPOS; do
     echo "==> $node: registering $name for $repo"

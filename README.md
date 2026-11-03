@@ -127,6 +127,11 @@ to `agent-redeploy-ssh` on every Docker host (from the janitor's address only), 
 is pinned to the janitor's address. `deploy/low-priority-runners.sh` adds low-priority runners
 (see its header).
 
+Runners that update themselves keep their previous version and the unpacked download, about 1.4 GB
+per instance. `deploy/lxc/runner-cleanup.sh` removes those every Saturday at 04:00 Eastern, and
+`low-priority-runners.sh` installs it. On any other runner LXC, push the script in and run
+`bash runner-cleanup.sh install` once. New instances on that LXC are then covered automatically.
+
 ## Secrets and variables
 
 This repository contains **no secrets**. Set them under **Settings → Secrets and variables →
