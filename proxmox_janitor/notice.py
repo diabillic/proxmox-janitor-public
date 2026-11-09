@@ -26,14 +26,17 @@ ICON = {"error": "❌", "warning": "⚠️", "info": "ℹ️", "ok": "✅"}
 PAGE = 3800  # characters per embed description; Discord allows 4096 per embed and 6000 per message
 WEBHOOK = re.compile(r"^https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+/?$")
 FIXED, CLEARED = "fixed", "cleared"
-# Who Discord shows as the sender: the agent, named like its container (proxmox_janitor -> proxmox-janitor).
+# Who Discord shows as the sender: the agent, named like its container (e.g. unifi_agent -> unifi-agent).
 AGENT_NAME = (__package__ or "agent").split(".")[0].replace("_", "-")
-# The sender's avatar: the icon of the service the agent looks after (dashboard-icons, via jsDelivr).
+# The sender's avatar: the icon of the service the agent looks after, by AGENT_NAME prefix. A name is a
+# dashboard-icons icon (via jsDelivr); a full URL is used as it is, for services that set has no icon for.
 ICONS = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons@main/png/{}.png"
 SERVICES = {"sonarr": "sonarr", "radarr": "radarr", "unraid": "unraid", "proxmox": "proxmox",
             "dockerfile": "docker", "crowdsec": "crowdsec", "unifi": "unifi",
-            "gdrive": "google-drive"}
-AVATAR = next((ICONS.format(icon) for prefix, icon in SERVICES.items() if AGENT_NAME.startswith(prefix)), "")
+            "gdrive": "google-drive", "pihole": "pi-hole",
+            "sensi": "https://cdn.jsdelivr.net/gh/diabillic/sensi-agent-public@main/assets/sensi.png"}
+AVATAR = next((icon if icon.startswith("https://") else ICONS.format(icon)
+               for prefix, icon in SERVICES.items() if AGENT_NAME.startswith(prefix)), "")
 
 
 @dataclass
